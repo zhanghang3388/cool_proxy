@@ -1,0 +1,25 @@
+{
+  "name": "cool-proxy-panel",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "naive-ui": "^2.40.1",
+    "pinia": "^2.2.4",
+    "vue": "^3.5.13",
+    "vue-router": "^4.4.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.6.3",
+    "vfonts": "^0.0.3",
+    "vite": "^6.0.3",
+    "vue-tsc": "^2.1.10"
+  }
+}

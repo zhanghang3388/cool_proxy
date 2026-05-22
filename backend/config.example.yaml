@@ -1,0 +1,33 @@
+# 监听地址
+host: "0.0.0.0"
+port: 8317
+
+# 认证文件存放目录（codex-*.json）
+auth_dir: "./auths"
+
+# 代理 API 的下游 key（客户端调用 /v1/* 时用）
+api_keys:
+  - "sk-cool-proxy-change-me"
+
+# 管理面板的访问 token（前端登录后会带在请求头）
+admin_token: "admin-change-me"
+
+# 上游 OpenAI Codex 端点
+upstream:
+  base_url: "https://chatgpt.com/backend-api/codex"
+
+# 失败处理
+retry:
+  max_retries: 3
+  cooldown_seconds: 60          # 单次失败冷却
+  long_cooldown_seconds: 300    # 连续失败长冷却
+  failure_threshold: 3          # 连续失败几次进入长冷却
+
+# token 刷新
+token_refresh:
+  scan_interval_seconds: 60
+  refresh_before_expire_seconds: 300
+
+# 日志
+log:
+  level: "info"   # trace / debug / info / warn / error

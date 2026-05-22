@@ -1,0 +1,291 @@
+<script setup lang="ts">
+import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import {
+  NCard, NDataTable, NSpace, NButton, NTag, NUpload, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
+  NSelect,
+  useMessage,
+  type DataTableColumns,
+  type UploadFileInfo,
+} from 'naive-ui'
+import {
+  AccountView, StatsView, ProxyEntry,
+  listAccounts, uploadAccounts, deleteAccount, refreshAccount, resetCooldown,
+  patchAccount, reloadFromDisk, getStats, listProxies, setAccountProxy,
+} from '../api'
+
+const accounts = ref<AccountView[]>([])
+const proxies = ref<ProxyEntry[]>([])
+const stats = ref<StatsView | null>(null)
+const loading = ref(false)
+const message = useMessage()
+
+let timer: number | null = null
+
+async function refresh() {
+  try {
+    const [list, s, p] = await Promise.all([listAccounts(), getStats(), listProxies()])
+    accounts.value = list
+    stats.value = s
+    proxies.value = p
+  } catch (e) {
+    message.error(`加载失败：${(e as Error).message}`)
+  }
+}
+
+onMounted(async () => {
+  loading.value = true
+  await refresh()
+  loading.value = false
+  timer = window.setInterval(refresh, 8000)
+})
+onUnmounted(() => {
+  if (timer) window.clearInterval(timer)
+})
+
+function fmtTime(s: string | null): string {
+  if (!s) return '-'
+  try {
+    return new Date(s).toLocaleString()
+  } catch {
+    return s
+  }
+}
+
+const columns = computed<DataTableColumns<AccountView>>(() => [
+  { title: '邮箱', key: 'email', minWidth: 200, ellipsis: { tooltip: true } },
+  {
+    title: '套餐',
+    key: 'plan',
+    width: 90,
+    render: (row) => row.plan ?? '-',
+  },
+  {
+    title: '状态',
+    key: 'status',
+    width: 140,
+    render: (row) => {
+      const tags: ReturnType<typeof h>[] = []
+      if (!row.enabled) {
+        tags.push(h(NTag, { type: 'default', size: 'small' }, { default: () => '禁用' }))
+      } else if (row.cooldown_until && new Date(row.cooldown_until) > new Date()) {
+        tags.push(h(NTag, { type: 'warning', size: 'small' }, { default: () => '冷却中' }))
+      } else if (row.expired) {
+        tags.push(h(NTag, { type: 'error', size: 'small' }, { default: () => '已过期' }))
+      } else {
+        tags.push(h(NTag, { type: 'success', size: 'small' }, { default: () => '可用' }))
+      }
+      return h(NSpace, { size: 4 }, { default: () => tags })
+    },
+  },
+  {
+    title: '到期时间',
+    key: 'expire_at',
+    width: 170,
+    render: (row) => fmtTime(row.expire_at),
+  },
+  {
+    title: '代理',
+    key: 'proxy',
+    width: 220,
+    render: (row) => {
+      const opts = [
+        { label: '直连', value: '__direct__' },
+        ...proxies.value.map((p) => ({
+          label: p.label ? `${p.label} (${p.url})` : p.url,
+          value: p.id,
+        })),
+      ]
+      // 账号绑定的 url 不在代理池里时（被删除过），显示成自定义
+      const known = !row.proxy_url || row.proxy_id !== null
+      if (!known) {
+        opts.push({ label: `自定义 (${row.proxy_url})`, value: '__custom__' })
+      }
+      const value = !row.proxy_url ? '__direct__' : row.proxy_id ?? '__custom__'
+      return h(NSelect, {
+        value,
+        options: opts,
+        size: 'small',
+        consistentMenuWidth: false,
+        'onUpdate:value': async (v: string) => {
+          if (v === '__custom__') return
+          try {
+            if (v === '__direct__') {
+              await setAccountProxy(row.id, { proxy_id: '' })
+            } else {
+              await setAccountProxy(row.id, { proxy_id: v })
+            }
+            message.success('已更新代理')
+            await refresh()
+          } catch (e) {
+            message.error((e as Error).message)
+          }
+        },
+      })
+    },
+  },
+  {
+    title: '最近刷新',
+    key: 'last_refresh_at',
+    width: 170,
+    render: (row) => fmtTime(row.last_refresh_at),
+  },
+  {
+    title: '请求 / 失败',
+    key: 'usage',
+    width: 110,
+    render: (row) => `${row.total_requests} / ${row.total_failures}`,
+  },
+  {
+    title: '失败次数',
+    key: 'failure_count',
+    width: 90,
+  },
+  {
+    title: '最近错误',
+    key: 'last_error',
+    minWidth: 200,
+    ellipsis: { tooltip: true },
+    render: (row) => row.last_error ?? '-',
+  },
+  {
+    title: '启用',
+    key: 'enabled',
+    width: 80,
+    render: (row) =>
+      h(NSwitch, {
+        value: row.enabled,
+        size: 'small',
+        'onUpdate:value': async (v: boolean) => {
+          try {
+            await patchAccount(row.id, { enabled: v })
+            row.enabled = v
+            message.success(v ? '已启用' : '已禁用')
+          } catch (e) {
+            message.error(`操作失败：${(e as Error).message}`)
+          }
+        },
+      }),
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 220,
+    render: (row) =>
+      h(NSpace, { size: 4 }, {
+        default: () => [
+          h(
+            NButton,
+            { size: 'small', onClick: () => doRefresh(row.id) },
+            { default: () => '刷新 token' },
+          ),
+          h(
+            NButton,
+            { size: 'small', onClick: () => doResetCooldown(row.id) },
+            { default: () => '清除冷却' },
+          ),
+          h(
+            NPopconfirm,
+            { onPositiveClick: () => doDelete(row.id) },
+            {
+              default: () => '确定删除该账号？认证文件也会被删除。',
+              trigger: () =>
+                h(NButton, { size: 'small', type: 'error', ghost: true }, { default: () => '删除' }),
+            },
+          ),
+        ],
+      }),
+  },
+])
+
+async function doRefresh(id: string) {
+  try {
+    await refreshAccount(id)
+    message.success('已刷新')
+    await refresh()
+  } catch (e) {
+    message.error(`刷新失败：${(e as Error).message}`)
+  }
+}
+
+async function doResetCooldown(id: string) {
+  try {
+    await resetCooldown(id)
+    message.success('已清除冷却')
+    await refresh()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+async function doDelete(id: string) {
+  try {
+    await deleteAccount(id)
+    message.success('已删除')
+    await refresh()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+async function handleUpload({ fileList }: { fileList: UploadFileInfo[] }) {
+  const files: File[] = fileList
+    .map((f) => f.file as File | null)
+    .filter((f): f is File => !!f)
+  if (!files.length) return
+  try {
+    const res = await uploadAccounts(files)
+    if (res.imported.length) message.success(`导入 ${res.imported.length} 个账号`)
+    if (res.errors.length) message.warning(`错误：${res.errors.join('; ')}`)
+    await refresh()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+async function handleReload() {
+  try {
+    const r = await reloadFromDisk()
+    message.success(`已重新加载，共 ${r.count} 个账号`)
+    await refresh()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+</script>
+
+<template>
+  <n-space vertical :size="16">
+    <n-grid :cols="4" :x-gap="12" v-if="stats">
+      <n-gi><n-card><n-statistic label="账号总数" :value="stats.total_accounts" /></n-card></n-gi>
+      <n-gi><n-card><n-statistic label="启用中" :value="stats.enabled_accounts" /></n-card></n-gi>
+      <n-gi><n-card><n-statistic label="冷却中" :value="stats.cooling_down" /></n-card></n-gi>
+      <n-gi><n-card><n-statistic label="累计请求 / 失败" :value="`${stats.total_requests} / ${stats.total_failures}`" /></n-card></n-gi>
+    </n-grid>
+
+    <n-card title="账号列表">
+      <template #header-extra>
+        <n-space>
+          <n-upload
+            multiple
+            :show-file-list="false"
+            :default-upload="false"
+            accept=".json,application/json"
+            @update:file-list="(list: UploadFileInfo[]) => handleUpload({ fileList: list })"
+          >
+            <n-button type="primary">上传认证文件</n-button>
+          </n-upload>
+          <n-button @click="handleReload">从磁盘重新加载</n-button>
+          <n-button @click="refresh" :loading="loading">手动刷新</n-button>
+        </n-space>
+      </template>
+      <n-data-table
+        :columns="columns"
+        :data="accounts"
+        :bordered="false"
+        :row-key="(row: AccountView) => row.id"
+        :scroll-x="1620"
+        size="small"
+      />
+    </n-card>
+  </n-space>
+</template>

@@ -1,0 +1,22 @@
+# Rust
+/backend/target/
+*.pdb
+
+# 认证文件（含敏感 token）
+/backend/auths/
+!/backend/auths/.gitkeep
+
+# 配置（含 admin_token 和 api_keys）
+/backend/config.yaml
+
+# Node
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
