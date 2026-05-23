@@ -67,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
     // /v1/* 反代（OpenAI 兼容）
     // 显式列出：chat_completions 走翻译层；responses / models 走老的反代/内置 handler；
     // 其他未识别的 /v1/* 走兜底 404。
+    // /backend-api/codex/* 是 codex CLI 默认拼路径的方式（base_url 不带 /v1，直接拼 /responses），
+    // 给它一个 alias 命中同一个 proxy_handler。
     let proxy_router = Router::new()
         .route(
             "/v1/chat/completions",
@@ -76,6 +78,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/responses/*rest", any(proxy::proxy_handler))
         .route("/v1/models", any(proxy::proxy_handler))
         .route("/v1/models/*id", any(proxy::proxy_handler))
+        // codex CLI 兼容
+        .route("/backend-api/codex/responses", any(proxy::proxy_handler))
+        .route(
+            "/backend-api/codex/responses/*rest",
+            any(proxy::proxy_handler),
+        )
         .with_state(state.clone());
 
     // /api/* 管理面板接口

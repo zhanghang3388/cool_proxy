@@ -355,9 +355,60 @@ pub async fn proxy_handler(
 }
 
 fn extract_upstream_path(uri: &Uri) -> Option<String> {
-    // 入站路径形如 "/v1/chat/completions?x=y"，原样转给上游
+    // 入站路径形如 "/v1/chat/completions?x=y"，转给 codex 上游时去掉前缀。
+    // 上游的 base_url 已经包含 "/backend-api/codex"，所以入站的 "/v1/..." 和
+    // "/backend-api/codex/..." 都要剥掉，只留下 "/responses" / "/responses/compact" / "/models" 这些。
     let pq = uri.path_and_query()?;
-    Some(pq.as_str().to_string())
+    let s = pq.as_str();
+    let (path, query) = match s.find('?') {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    };
+    let stripped = if let Some(rest) = path.strip_prefix("/backend-api/codex") {
+        rest
+    } else if let Some(rest) = path.strip_prefix("/v1") {
+        rest
+    } else {
+        path
+    };
+    let stripped = if stripped.is_empty() { "/" } else { stripped };
+    Some(format!("{stripped}{query}"))
+}
+
+#[cfg(test)]
+mod extract_path_tests {
+    use super::*;
+
+    fn run(p: &str) -> String {
+        let uri: Uri = p.parse().unwrap();
+        extract_upstream_path(&uri).unwrap()
+    }
+
+    #[test]
+    fn strips_v1_prefix_from_openai_paths() {
+        assert_eq!(run("/v1/responses"), "/responses");
+        assert_eq!(run("/v1/responses/compact"), "/responses/compact");
+    }
+
+    #[test]
+    fn strips_backend_api_codex_prefix_from_codex_cli_paths() {
+        assert_eq!(run("/backend-api/codex/responses"), "/responses");
+        assert_eq!(
+            run("/backend-api/codex/responses/compact"),
+            "/responses/compact"
+        );
+    }
+
+    #[test]
+    fn preserves_query_string() {
+        assert_eq!(run("/v1/responses?stream=true"), "/responses?stream=true");
+    }
+
+    #[test]
+    fn paths_without_known_prefix_are_kept_as_is() {
+        assert_eq!(run("/responses"), "/responses");
+        assert_eq!(run("/healthz"), "/healthz");
+    }
 }
 
 /// 收集当前所有 enabled 且未死的账号的 plan 字符串（去重）。空池子返回空 vec。
