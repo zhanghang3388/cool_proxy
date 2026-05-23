@@ -39,6 +39,23 @@ export interface RebalanceResult {
   failed: string[]
 }
 
+export interface ProxyTestResult {
+  ok: boolean
+  latency_ms: number
+  ip: string | null
+  country: string | null
+  region: string | null
+  city: string | null
+  isp: string | null
+  org: string | null
+  asn: string | null
+  reverse: string | null
+  purity_score: number
+  purity_label: string
+  purity_reasons: string[]
+  error: string | null
+}
+
 export interface LogEntry {
   id: number
   at: string
@@ -197,6 +214,14 @@ export async function deleteProxy(id: string): Promise<void> {
 }
 export async function rebalanceProxies(only_unassigned: boolean): Promise<RebalanceResult> {
   const { data } = await http.post<RebalanceResult>('/proxies/rebalance', { only_unassigned })
+  return data
+}
+export async function testProxy(id: string): Promise<ProxyTestResult> {
+  const { data } = await http.post<ProxyTestResult>(
+    `/proxies/${encodeURIComponent(id)}/test`,
+    null,
+    { timeout: 30_000 },
+  )
   return data
 }
 

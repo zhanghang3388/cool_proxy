@@ -2,12 +2,13 @@
 import { computed, h, onMounted, ref } from 'vue'
 import {
   NCard, NDataTable, NSpace, NButton, NTag, NPopconfirm, NModal, NForm, NFormItem, NInput,
-  NCheckbox, NAlert, useMessage,
+  NCheckbox, NAlert, NDescriptions, NDescriptionsItem, NProgress, NSpin, NList, NListItem,
+  useMessage,
   type DataTableColumns,
 } from 'naive-ui'
 import {
-  ProxyEntry, listProxies, createProxy, updateProxy, deleteProxy,
-  rebalanceProxies, listAccounts, AccountView,
+  ProxyEntry, ProxyTestResult, listProxies, createProxy, updateProxy, deleteProxy,
+  rebalanceProxies, listAccounts, AccountView, testProxy,
 } from '../api'
 
 const proxies = ref<ProxyEntry[]>([])
@@ -22,6 +23,12 @@ const editingId = ref<string | null>(null)
 
 const showRebalance = ref(false)
 const onlyUnassigned = ref(true)
+
+const showTest = ref(false)
+const testing = ref(false)
+const testingRowId = ref<string | null>(null)
+const testTarget = ref<ProxyEntry | null>(null)
+const testResult = ref<ProxyTestResult | null>(null)
 
 async function refresh() {
   try {
@@ -122,6 +129,37 @@ async function doRebalance() {
   }
 }
 
+async function doTest(row: ProxyEntry) {
+  testTarget.value = row
+  testResult.value = null
+  testing.value = true
+  testingRowId.value = row.id
+  showTest.value = true
+  try {
+    const r = await testProxy(row.id)
+    testResult.value = r
+    if (r.ok) {
+      message.success(`可用 · ${r.latency_ms} ms`)
+    } else {
+      message.error(`不可用：${r.error ?? '未知错误'}`)
+    }
+  } catch (e) {
+    message.error((e as Error).message)
+    showTest.value = false
+  } finally {
+    testing.value = false
+    testingRowId.value = null
+  }
+}
+
+function purityColor(score: number): string {
+  if (score >= 80) return '#18a058'
+  if (score >= 60) return '#2080f0'
+  if (score >= 40) return '#f0a020'
+  if (score >= 20) return '#d03050'
+  return '#a01020'
+}
+
 const columns = computed<DataTableColumns<ProxyEntry>>(() => [
   {
     title: '标签',
@@ -139,10 +177,22 @@ const columns = computed<DataTableColumns<ProxyEntry>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 180,
+    width: 240,
     render: (r) =>
       h(NSpace, { size: 4 }, {
         default: () => [
+          h(
+            NButton,
+            {
+              size: 'small',
+              type: 'primary',
+              ghost: true,
+              loading: testingRowId.value === r.id,
+              disabled: testing.value && testingRowId.value !== r.id,
+              onClick: () => doTest(r),
+            },
+            { default: () => '测试' },
+          ),
           h(NButton, { size: 'small', onClick: () => openEdit(r) }, { default: () => '编辑' }),
           h(NPopconfirm,
             { onPositiveClick: () => doDelete(r) },
@@ -228,6 +278,102 @@ const columns = computed<DataTableColumns<ProxyEntry>>(() => [
         <n-space justify="end">
           <n-button @click="showRebalance = false">取消</n-button>
           <n-button type="primary" @click="doRebalance">执行</n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
+
+    <n-modal v-model:show="showTest" preset="card" title="代理测试" style="width: 560px">
+      <n-space vertical :size="12">
+        <n-descriptions v-if="testTarget" :column="1" size="small" bordered>
+          <n-descriptions-item label="标签">
+            {{ testTarget.label || '-' }}
+          </n-descriptions-item>
+          <n-descriptions-item label="代理 URL">
+            <code style="word-break: break-all;">{{ testTarget.url }}</code>
+          </n-descriptions-item>
+        </n-descriptions>
+
+        <div v-if="testing" style="text-align: center; padding: 24px 0;">
+          <n-spin size="medium" />
+          <div style="margin-top: 12px; color: #888;">正在通过该代理请求 ip-api.com…</div>
+        </div>
+
+        <template v-else-if="testResult">
+          <n-alert v-if="!testResult.ok" type="error" :title="`不可用 · ${testResult.latency_ms} ms`">
+            {{ testResult.error ?? '未知错误' }}
+          </n-alert>
+
+          <template v-else>
+            <n-alert type="success" :title="`可用 · 延迟 ${testResult.latency_ms} ms`">
+              出口 IP：<b>{{ testResult.ip ?? '-' }}</b>
+            </n-alert>
+
+            <n-card title="出口节点" size="small">
+              <n-descriptions :column="2" size="small" label-placement="left" bordered>
+                <n-descriptions-item label="IP">
+                  {{ testResult.ip ?? '-' }}
+                </n-descriptions-item>
+                <n-descriptions-item label="国家">
+                  {{ testResult.country ?? '-' }}
+                </n-descriptions-item>
+                <n-descriptions-item label="地区">
+                  {{ testResult.region ?? '-' }}
+                </n-descriptions-item>
+                <n-descriptions-item label="城市">
+                  {{ testResult.city ?? '-' }}
+                </n-descriptions-item>
+                <n-descriptions-item label="ISP" :span="2">
+                  {{ testResult.isp ?? '-' }}
+                </n-descriptions-item>
+                <n-descriptions-item label="组织" :span="2">
+                  {{ testResult.org ?? '-' }}
+                </n-descriptions-item>
+                <n-descriptions-item label="ASN" :span="2">
+                  {{ testResult.asn ?? '-' }}
+                </n-descriptions-item>
+                <n-descriptions-item label="反向 DNS" :span="2">
+                  {{ testResult.reverse || '-' }}
+                </n-descriptions-item>
+              </n-descriptions>
+            </n-card>
+
+            <n-card size="small">
+              <template #header>
+                纯净度
+                <n-tag :color="{ color: purityColor(testResult.purity_score), textColor: '#fff' }" size="small" style="margin-left: 8px;">
+                  {{ testResult.purity_label }}
+                </n-tag>
+              </template>
+              <n-progress
+                type="line"
+                :percentage="testResult.purity_score"
+                :color="purityColor(testResult.purity_score)"
+                :show-indicator="true"
+                indicator-placement="inside"
+              />
+              <div style="margin-top: 12px;">
+                <div style="color: #888; font-size: 12px; margin-bottom: 4px;">评分依据：</div>
+                <n-list v-if="testResult.purity_reasons.length" size="small" :show-divider="false">
+                  <n-list-item v-for="(r, i) in testResult.purity_reasons" :key="i">
+                    {{ r }}
+                  </n-list-item>
+                </n-list>
+                <div v-else style="color: #888; font-size: 12px;">
+                  无明显机房特征，未发现扣分项。
+                </div>
+              </div>
+            </n-card>
+          </template>
+        </template>
+
+        <n-space justify="end">
+          <n-button
+            :disabled="testing || !testTarget"
+            @click="testTarget && doTest(testTarget)"
+          >
+            重新测试
+          </n-button>
+          <n-button type="primary" @click="showTest = false">关闭</n-button>
         </n-space>
       </n-space>
     </n-modal>

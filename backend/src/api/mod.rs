@@ -32,6 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             delete(proxies::delete_one).patch(proxies::update),
         )
         .route("/proxies/rebalance", post(proxies::rebalance))
+        .route("/proxies/:id/test", post(proxies::test_one))
         .route("/stats", get(stats::overview))
         .route("/usage", get(usage::report))
         .route("/config", get(stats::current_config))
