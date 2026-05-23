@@ -1,0 +1,6 @@
+{"type":"response.created","response":{"id":"resp_x","created_at":1700000000,"model":"gpt-5-codex"}}
+{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"calc"}}
+{"type":"response.function_call_arguments.delta","delta":"{\"expr"}
+{"type":"response.function_call_arguments.delta","delta":"\":\"2+2\"}"}
+{"type":"response.function_call_arguments.done","arguments":"{\"expr\":\"2+2\"}"}
+{"type":"response.completed","response":{"id":"resp_x","usage":{"input_tokens":12,"output_tokens":7,"total_tokens":19}}}

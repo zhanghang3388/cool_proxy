@@ -1,0 +1,4 @@
+{"type":"response.created","response":{"id":"resp_123","created_at":1700000000,"model":"gpt-5-codex"}}
+{"type":"response.output_text.delta","delta":"Hello"}
+{"type":"response.output_text.delta","delta":", world!"}
+{"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}

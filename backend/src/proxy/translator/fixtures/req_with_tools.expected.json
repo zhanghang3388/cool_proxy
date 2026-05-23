@@ -1,0 +1,39 @@
+{
+  "model": "gpt-5-codex",
+  "instructions": "",
+  "stream": true,
+  "include": ["reasoning.encrypted_content"],
+  "parallel_tool_calls": true,
+  "store": false,
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "tools": [
+    {
+      "type": "function",
+      "name": "calc",
+      "description": "Evaluate arithmetic.",
+      "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}}
+    }
+  ],
+  "tool_choice": "auto",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "What's 2+2?"}]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_abc",
+      "name": "calc",
+      "arguments": "{\"expr\":\"2+2\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_abc",
+      "output": "4"
+    }
+  ]
+}

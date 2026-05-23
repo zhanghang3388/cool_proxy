@@ -65,8 +65,17 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(Any);
 
     // /v1/* 反代（OpenAI 兼容）
+    // 显式列出：chat_completions 走翻译层；responses / models 走老的反代/内置 handler；
+    // 其他未识别的 /v1/* 走兜底 404。
     let proxy_router = Router::new()
-        .route("/v1/*rest", any(proxy::proxy_handler))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(proxy::chat_completions_handler),
+        )
+        .route("/v1/responses", any(proxy::proxy_handler))
+        .route("/v1/responses/*rest", any(proxy::proxy_handler))
+        .route("/v1/models", any(proxy::proxy_handler))
+        .route("/v1/models/*id", any(proxy::proxy_handler))
         .with_state(state.clone());
 
     // /api/* 管理面板接口

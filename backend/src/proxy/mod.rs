@@ -17,6 +17,7 @@ pub mod clients;
 pub mod error_class;
 pub mod log;
 pub mod models_catalog;
+pub mod translator;
 pub use clients::ProxiedClients;
 pub use error_class::{classify, quota_backoff, ErrorKind};
 pub use log::{LogEntry, RequestLog};
@@ -669,4 +670,521 @@ async fn forward_once(
         .map_err(|e| anyhow::anyhow!("build response: {e}"))?;
     *resp.headers_mut() = headers;
     Ok((resp, retry_after))
+}
+
+/// OpenAI 风格的错误体；4xx/5xx 失败时统一这个形状返给客户端。
+fn openai_error_response(status: StatusCode, message: &str) -> Response {
+    let kind = if status.is_server_error() {
+        "server_error"
+    } else {
+        "invalid_request_error"
+    };
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": kind,
+            "code": serde_json::Value::Null,
+        }
+    });
+    (status, axum::Json(body)).into_response()
+}
+
+/// 流式状态码 + 错误片段 → 一条 SSE 错误事件。客户端会收到 `event: error\ndata: {...}\n\n`。
+fn sse_error_event(status: StatusCode, message: &str) -> String {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": if status.is_server_error() { "server_error" } else { "invalid_request_error" },
+            "code": serde_json::Value::Null,
+            "status": status.as_u16(),
+        }
+    });
+    format!("event: error\ndata: {}\n\n", body)
+}
+
+fn sse_data_line(payload: &serde_json::Value) -> String {
+    format!("data: {}\n\n", payload)
+}
+
+/// `/v1/chat/completions`：把 OpenAI ChatCompletion 形状的请求翻译成 codex `/responses`，
+/// 转发到上游，把 codex SSE 流反向翻译成 chat.completion.chunk 流（或聚合成非流式响应）。
+pub async fn chat_completions_handler(
+    State(app): State<Arc<AppState>>,
+    req: Request,
+) -> Response {
+    if !verify_client_key(req.headers(), &app.config.api_keys) {
+        return openai_error_response(StatusCode::UNAUTHORIZED, "missing or invalid api key");
+    }
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("read request body: {e}"),
+            );
+        }
+    };
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+    let model = raw
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if model.is_empty() {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required field: model",
+        );
+    }
+    let client_wants_stream = raw
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 翻译成 codex /responses 形状。cool_proxy 内部一律 stream=true 上游。
+    let codex_body = translator::translate_request(&model, &body_bytes, true);
+    let codex_body_bytes = Bytes::from(codex_body.to_string().into_bytes());
+
+    let upstream_path = "/responses".to_string();
+    let max_attempts = app.config.retry.max_retries.max(1);
+    let started = Instant::now();
+    let mut last_account: Option<String> = None;
+    let mut last_error: Option<(StatusCode, String)> = None;
+
+    for attempt in 0..max_attempts {
+        let selected = match app.pool.pick_for(&model) {
+            Ok(s) => s,
+            Err(PoolError::Empty) => {
+                return openai_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no codex accounts configured",
+                );
+            }
+            Err(PoolError::AllUnavailable) => {
+                return openai_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "all accounts cooling down or disabled",
+                );
+            }
+            Err(PoolError::Db(e)) => {
+                error!("pick from db failed: {e:?}");
+                return openai_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("db error: {e}"),
+                );
+            }
+        };
+        last_account = Some(selected.id.clone());
+
+        debug!(
+            attempt,
+            account = %selected.id,
+            model = %model,
+            stream = client_wants_stream,
+            "chat-completions forwarding"
+        );
+
+        let res = forward_once(
+            &app.clients,
+            &app.config.upstream.base_url,
+            &upstream_path,
+            &Method::POST,
+            &parts.headers,
+            &codex_body_bytes,
+            &selected.access_token,
+            &selected.account_id,
+            &selected.proxy_url,
+        )
+        .await;
+
+        match res {
+            Ok((mut resp, retry_after)) => {
+                let status = resp.status();
+                if status.is_success() {
+                    // 成功：根据 client_wants_stream 选择翻译路径
+                    if client_wants_stream {
+                        return stream_translate_response(
+                            app.clone(),
+                            resp,
+                            selected.id.clone(),
+                            model.clone(),
+                            body_bytes.clone(),
+                            parts.method.clone(),
+                            attempt + 1,
+                            started,
+                        );
+                    } else {
+                        return aggregate_translate_response(
+                            app.clone(),
+                            resp,
+                            selected.id.clone(),
+                            model.clone(),
+                            body_bytes.clone(),
+                            parts.method.clone(),
+                            attempt + 1,
+                            started,
+                        )
+                        .await;
+                    }
+                }
+
+                // 失败：吃掉前几百字节做 last_error，然后分类
+                let body = std::mem::replace(resp.body_mut(), Body::empty());
+                let snippet = match axum::body::to_bytes(body, 4 * 1024).await {
+                    Ok(b) if !b.is_empty() => {
+                        let s = String::from_utf8_lossy(&b).into_owned();
+                        truncate_snippet(&s, 300)
+                    }
+                    _ => format!("upstream {status}"),
+                };
+                let kind = app.pool.report(ReportContext {
+                    id: &selected.id,
+                    model: &model,
+                    status: Some(status.as_u16()),
+                    retry_after,
+                    message: &snippet,
+                });
+
+                match kind {
+                    ErrorKind::Auth => {
+                        spawn_refresh(app.clone(), selected.id.clone());
+                        warn!(
+                            account = %selected.id,
+                            status = %status,
+                            "chat: auth error, refresh spawned, switching account"
+                        );
+                        last_error = Some((status, format!("upstream {status}: {snippet}")));
+                        continue;
+                    }
+                    ErrorKind::Client => {
+                        app.request_log.push(
+                            &parts.method,
+                            &upstream_path,
+                            Some(selected.id.clone()),
+                            Some(model.clone()),
+                            status.as_u16(),
+                            started.elapsed().as_millis() as u64,
+                            attempt + 1,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        return openai_error_response(status, &snippet);
+                    }
+                    ErrorKind::Quota
+                    | ErrorKind::NotFound
+                    | ErrorKind::Transient
+                    | ErrorKind::Network => {
+                        warn!(
+                            account = %selected.id,
+                            status = %status,
+                            kind = kind.label(),
+                            "chat: upstream error, will retry"
+                        );
+                        last_error = Some((status, format!("upstream {status}: {snippet}")));
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                error!(account = %selected.id, "chat: forward error: {e:?}");
+                let msg = format!("network: {e}");
+                app.pool.report(ReportContext {
+                    id: &selected.id,
+                    model: &model,
+                    status: None,
+                    retry_after: None,
+                    message: &msg,
+                });
+                last_error = Some((
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream network error: {e}"),
+                ));
+                continue;
+            }
+        }
+    }
+
+    let (status, msg) = last_error.unwrap_or((
+        StatusCode::BAD_GATEWAY,
+        "all retries failed".to_string(),
+    ));
+    info!("chat: giving up: {status} {msg}");
+    app.request_log.push(
+        &parts.method,
+        &upstream_path,
+        last_account,
+        Some(model),
+        status.as_u16(),
+        started.elapsed().as_millis() as u64,
+        max_attempts,
+        None,
+        None,
+        None,
+        Some(msg.clone()),
+    );
+    openai_error_response(status, &msg)
+}
+
+/// 把上游 codex SSE 流翻译成 OpenAI chat.completion.chunk 流，边收边回写客户端。
+/// 同时 tee 一份给 RequestLog 的 usage 解析（保留原有计费逻辑）。
+fn stream_translate_response(
+    app: Arc<AppState>,
+    mut resp: Response,
+    account_id: String,
+    model: String,
+    original_request: Bytes,
+    method: Method,
+    attempt_count: u32,
+    started: Instant,
+) -> Response {
+    let upstream_body = std::mem::replace(resp.body_mut(), Body::empty());
+
+    let log = app.request_log.clone();
+    let log_method = method.clone();
+    let log_path = "/responses".to_string();
+    let log_acct = account_id.clone();
+    let log_model = Some(model.clone());
+    let log_attempts = attempt_count;
+    let pool = app.pool.clone();
+    let success_acct = account_id.clone();
+    let success_model = model.clone();
+
+    // 启动 codex SSE → OpenAI chunk 翻译流
+    let original_for_translator = original_request.clone();
+    let model_for_translator = model.clone();
+
+    let s = async_stream::stream! {
+        use futures_util::StreamExt as _;
+        let mut translator = translator::StreamTranslator::new(
+            &model_for_translator,
+            &original_for_translator,
+        );
+        let mut up = upstream_body.into_data_stream();
+        let mut buf = bytes::BytesMut::new();
+        let mut tail = bytes::BytesMut::with_capacity(32 * 1024);
+        let mut completed = false;
+
+        while let Some(chunk) = up.next().await {
+            match chunk {
+                Ok(b) => {
+                    // tee：尾部 32KB 给 parse_usage 用
+                    if tail.len() + b.len() > 32 * 1024 {
+                        let drop = (tail.len() + b.len()).saturating_sub(32 * 1024).min(tail.len());
+                        let _ = tail.split_to(drop);
+                    }
+                    if b.len() >= 32 * 1024 {
+                        tail.clear();
+                        let start = b.len() - 32 * 1024;
+                        tail.extend_from_slice(&b[start..]);
+                    } else {
+                        tail.extend_from_slice(&b);
+                    }
+
+                    buf.extend_from_slice(&b);
+                    // SSE 按双换行分事件，行内按 \n 分。这里只取以 "data: " 开头的行，逐行解析。
+                    while let Some(idx) = find_double_newline(&buf) {
+                        let event_block = buf.split_to(idx + 2); // 含分隔
+                        let event_slice: &[u8] = &event_block;
+                        for line in event_slice.split(|&c| c == b'\n') {
+                            let line = trim_eol(line);
+                            if !line.starts_with(b"data:") {
+                                continue;
+                            }
+                            let payload = &line[5..];
+                            let payload = if payload.first() == Some(&b' ') {
+                                &payload[1..]
+                            } else {
+                                payload
+                            };
+                            if payload == b"[DONE]" {
+                                continue;
+                            }
+                            let Ok(ev) = serde_json::from_slice::<serde_json::Value>(payload) else {
+                                continue;
+                            };
+                            let chunks = translator.push(&ev);
+                            for chunk in chunks {
+                                let line = sse_data_line(&chunk);
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(line));
+                            }
+                            if ev.get("type").and_then(|v| v.as_str())
+                                == Some("response.completed")
+                            {
+                                completed = true;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let line = sse_error_event(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("upstream stream error: {e}"),
+                    );
+                    yield Ok(bytes::Bytes::from(line));
+                    break;
+                }
+            }
+        }
+
+        // 流结束：发 [DONE]
+        yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+
+        // 写 RequestLog（usage 从 tail 解析），并标记成功
+        let (input, output, total) = parse_usage(&tail);
+        log.push(
+            &log_method,
+            &log_path,
+            Some(log_acct),
+            log_model,
+            200,
+            started.elapsed().as_millis() as u64,
+            log_attempts,
+            input,
+            output,
+            total,
+            None,
+        );
+        if completed {
+            pool.report_success_for(&success_acct, &success_model);
+        }
+    };
+
+    let body = Body::from_stream(s);
+    let mut out = Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .expect("build sse response");
+    let h = out.headers_mut();
+    h.insert("content-type", HeaderValue::from_static("text/event-stream"));
+    h.insert("cache-control", HeaderValue::from_static("no-cache"));
+    h.insert("connection", HeaderValue::from_static("keep-alive"));
+    out
+}
+
+/// 非流式：等所有 codex SSE 收完，构建一个 ChatCompletion JSON 返回。
+async fn aggregate_translate_response(
+    app: Arc<AppState>,
+    mut resp: Response,
+    account_id: String,
+    model: String,
+    original_request: Bytes,
+    method: Method,
+    attempt_count: u32,
+    started: Instant,
+) -> Response {
+    let upstream_body = std::mem::replace(resp.body_mut(), Body::empty());
+
+    let mut up = upstream_body.into_data_stream();
+    let mut buf = bytes::BytesMut::new();
+    let mut tail = bytes::BytesMut::with_capacity(32 * 1024);
+    let mut agg = translator::Aggregator::new(&model, &original_request);
+
+    while let Some(chunk) = up.next().await {
+        match chunk {
+            Ok(b) => {
+                if tail.len() + b.len() > 32 * 1024 {
+                    let drop = (tail.len() + b.len()).saturating_sub(32 * 1024).min(tail.len());
+                    let _ = tail.split_to(drop);
+                }
+                if b.len() >= 32 * 1024 {
+                    tail.clear();
+                    let start = b.len() - 32 * 1024;
+                    tail.extend_from_slice(&b[start..]);
+                } else {
+                    tail.extend_from_slice(&b);
+                }
+
+                buf.extend_from_slice(&b);
+                while let Some(idx) = find_double_newline(&buf) {
+                    let event_block = buf.split_to(idx + 2);
+                    let event_slice: &[u8] = &event_block;
+                    for line in event_slice.split(|&c| c == b'\n') {
+                        let line = trim_eol(line);
+                        if !line.starts_with(b"data:") {
+                            continue;
+                        }
+                        let payload = &line[5..];
+                        let payload = if payload.first() == Some(&b' ') {
+                            &payload[1..]
+                        } else {
+                            payload
+                        };
+                        if payload == b"[DONE]" {
+                            continue;
+                        }
+                        let Ok(ev) = serde_json::from_slice::<serde_json::Value>(payload) else {
+                            continue;
+                        };
+                        agg.push(&ev);
+                    }
+                }
+            }
+            Err(e) => {
+                return openai_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream stream error: {e}"),
+                );
+            }
+        }
+    }
+
+    let completed = agg.is_completed();
+    let (input, output, total) = parse_usage(&tail);
+    app.request_log.push(
+        &method,
+        "/responses",
+        Some(account_id.clone()),
+        Some(model.clone()),
+        200,
+        started.elapsed().as_millis() as u64,
+        attempt_count,
+        input,
+        output,
+        total,
+        None,
+    );
+    if completed {
+        app.pool.report_success_for(&account_id, &model);
+    }
+    let final_obj = agg.finalize();
+    (StatusCode::OK, axum::Json(final_obj)).into_response()
+}
+
+fn find_double_newline(buf: &[u8]) -> Option<usize> {
+    // 兼容 \n\n 和 \r\n\r\n
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+        if i + 3 < buf.len()
+            && buf[i] == b'\r'
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn trim_eol(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 {
+        let c = line[end - 1];
+        if c == b'\r' || c == b'\n' {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    &line[..end]
 }
