@@ -44,6 +44,30 @@ pub fn classify(status: Option<u16>) -> ErrorKind {
     }
 }
 
+/// 带错误体内容的二次分类。404 这种状态码上游用来表达两种完全不同的情况：
+/// 1) "model 不支持"——错误体里通常含 `model`/`not_supported`/`invalid_model` 之类字样。
+/// 2) 笼统的 `{"detail":"Not Found"}`——nginx / 上游网关层的临时 404，跟 model 无关。
+/// 第二种如果按 NotFound 锁号 12h 太激进，降级成 Transient（累计 N 次才短冷却）。
+pub fn classify_with_body(status: Option<u16>, body_snippet: &str) -> ErrorKind {
+    let kind = classify(status);
+    if !matches!(kind, ErrorKind::NotFound) {
+        return kind;
+    }
+    let lower = body_snippet.to_ascii_lowercase();
+    let model_specific = lower.contains("model")
+        || lower.contains("not supported")
+        || lower.contains("not_supported")
+        || lower.contains("unsupported")
+        || lower.contains("does not exist")
+        || lower.contains("invalid_model")
+        || lower.contains("does_not_exist");
+    if model_specific {
+        ErrorKind::NotFound
+    } else {
+        ErrorKind::Transient
+    }
+}
+
 /// quota backoff：base = 1s，每升一级翻倍，封顶 30min。
 /// 返回 (cooldown, next_level)。
 pub fn quota_backoff(prev_level: i64) -> (Duration, i64) {
@@ -99,5 +123,41 @@ mod tests {
         assert_eq!(d, Duration::from_secs(30 * 60));
         // 已封顶后不再加级
         assert_eq!(lv_next, 60);
+    }
+
+    #[test]
+    fn classify_with_body_distinguishes_model_404_from_generic_404() {
+        // 上游用 404 + body 表达 model 不支持 → 仍是 NotFound
+        assert_eq!(
+            classify_with_body(Some(404), "{\"detail\":\"model 'gpt-X' is not supported\"}"),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            classify_with_body(Some(404), "model not_supported in this plan"),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            classify_with_body(Some(404), "the requested model does not exist"),
+            ErrorKind::NotFound
+        );
+        // nginx / 上游网关层的笼统 404 → 降级 Transient
+        assert_eq!(
+            classify_with_body(Some(404), "{\"detail\":\"Not Found\"}"),
+            ErrorKind::Transient
+        );
+        assert_eq!(
+            classify_with_body(Some(404), "<html>404 not found</html>"),
+            ErrorKind::Transient
+        );
+        assert_eq!(classify_with_body(Some(404), ""), ErrorKind::Transient);
+    }
+
+    #[test]
+    fn classify_with_body_other_codes_unchanged() {
+        // body 不影响非 404 的分类
+        assert_eq!(classify_with_body(Some(429), "anything"), ErrorKind::Quota);
+        assert_eq!(classify_with_body(Some(401), "model anything"), ErrorKind::Auth);
+        assert_eq!(classify_with_body(Some(500), "model not_supported"), ErrorKind::Transient);
+        assert_eq!(classify_with_body(None, "anything"), ErrorKind::Network);
     }
 }

@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::auth::codex::{scan_codex_files, CodexTokenStorage};
 use crate::config::Config;
-use crate::proxy::{classify, quota_backoff, ErrorKind};
+use crate::proxy::{classify_with_body, quota_backoff, ErrorKind};
 use crate::store::accounts as store_accounts;
 use crate::store::accounts::AccountRow;
 use crate::store::SqlitePool;
@@ -221,7 +221,7 @@ impl AccountPool {
 
     /// 错误分类化上报。返回这次错误的分类，调用方根据 kind 决定要不要 spawn refresh / 是否继续重试。
     pub fn report(&self, ctx: ReportContext<'_>) -> ErrorKind {
-        let kind = classify(ctx.status);
+        let kind = classify_with_body(ctx.status, ctx.message);
         let now_ms = Utc::now().timestamp_millis();
         let disable = self.cfg.retry.disable_cooldown;
         let status_i = ctx.status.map(|c| c as i64);

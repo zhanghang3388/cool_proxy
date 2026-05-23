@@ -19,7 +19,7 @@ pub mod log;
 pub mod models_catalog;
 pub mod translator;
 pub use clients::ProxiedClients;
-pub use error_class::{classify, quota_backoff, ErrorKind};
+pub use error_class::{classify, classify_with_body, quota_backoff, ErrorKind};
 pub use log::{LogEntry, RequestLog};
 
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9";
