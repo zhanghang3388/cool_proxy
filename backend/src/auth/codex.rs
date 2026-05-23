@@ -11,6 +11,7 @@ pub struct CodexTokenStorage {
     #[serde(default)]
     pub id_token: String,
     pub access_token: String,
+    #[serde(default)]
     pub refresh_token: String,
     #[serde(default)]
     pub account_id: String,
