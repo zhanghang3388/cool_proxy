@@ -56,7 +56,10 @@ fn build_client(proxy_url: Option<&str>) -> Result<reqwest::Client> {
     if let Some(url) = proxy_url {
         let proxy = reqwest::Proxy::all(url)
             .with_context(|| format!("parse proxy url: {url}"))?;
-        b = b.proxy(proxy).no_proxy();
+        b = b.proxy(proxy);
+    } else {
+        // 没指定代理 = 直连，强制忽略环境里的 HTTP(S)_PROXY，避免误走系统代理
+        b = b.no_proxy();
     }
     Ok(b.build()?)
 }
