@@ -124,6 +124,13 @@ export async function uploadAccounts(files: File[]): Promise<{ imported: string[
   return data
 }
 
+export async function importAccountsJson(
+  payload: { text?: string; token?: unknown; tokens?: unknown[] },
+): Promise<{ imported: string[]; errors: string[] }> {
+  const { data } = await http.post('/accounts/import', payload)
+  return data
+}
+
 export async function patchAccount(id: string, payload: { enabled?: boolean }): Promise<void> {
   await http.patch(`/accounts/${encodeURIComponent(id)}`, payload)
 }

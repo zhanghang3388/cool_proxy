@@ -269,6 +269,117 @@ pub async fn export_to_files(State(app): State<Arc<AppState>>) -> Response {
     Json(json!({"ok": true, "written": written, "errors": errors})).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct ImportPayload {
+    /// 三种形式都接受，按顺序优先：
+    /// - `tokens`: JSON 数组 [{...},{...}]，批量
+    /// - `token`: 单个 JSON 对象
+    /// - `text`: 文本（单行 JSON / 一行一个 JSON / 直接是 [{...}] 都能解）
+    #[serde(default)]
+    pub tokens: Option<Vec<CodexTokenStorage>>,
+    #[serde(default)]
+    pub token: Option<CodexTokenStorage>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// 把文本切成多个 JSON 字符串：先尝试整体当数组解；不行就按行扫，
+/// 找出每行 `{...}` 形式的 JSON。空行 / 注释 / 残缺都跳过。
+fn parse_text_to_storages(text: &str) -> Vec<CodexTokenStorage> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(arr) = serde_json::from_str::<Vec<CodexTokenStorage>>(trimmed) {
+        return arr;
+    }
+    if let Ok(one) = serde_json::from_str::<CodexTokenStorage>(trimmed) {
+        return vec![one];
+    }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+        if let Ok(s) = serde_json::from_str::<CodexTokenStorage>(line) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// 把一份 storage 入库（自动分配代理、生成 id、放进 DB）。返回成功的 account id 或错误说明。
+async fn import_one_storage(
+    app: &Arc<AppState>,
+    mut storage: CodexTokenStorage,
+    label: &str,
+) -> Result<String, String> {
+    if storage.access_token.is_empty() || storage.refresh_token.is_empty() {
+        return Err(format!("{label}: missing access_token / refresh_token"));
+    }
+    let id = derive_account_id(&storage);
+    if storage.proxy_url.trim().is_empty() {
+        let already_assigned = app
+            .pool
+            .get(&id)
+            .map(|a| !a.proxy_url.is_empty())
+            .unwrap_or(false);
+        if !already_assigned {
+            if let Some((_, url)) = app.proxy_pool.next_assignment() {
+                storage.proxy_url = url;
+            }
+        }
+    }
+    match app.pool.add_or_replace_from_storage(id.clone(), &storage) {
+        Ok(acc) => Ok(acc.id),
+        Err(e) => Err(format!("{id}: {e}")),
+    }
+}
+
+/// 通过 JSON body 导入账号，支持单个 / 数组 / 文本三种格式。
+pub async fn import_json(
+    State(app): State<Arc<AppState>>,
+    Json(payload): Json<ImportPayload>,
+) -> Response {
+    let mut storages: Vec<CodexTokenStorage> = Vec::new();
+    if let Some(arr) = payload.tokens {
+        storages.extend(arr);
+    }
+    if let Some(one) = payload.token {
+        storages.push(one);
+    }
+    if let Some(text) = payload.text {
+        storages.extend(parse_text_to_storages(&text));
+    }
+
+    if storages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "no parseable JSON tokens; expect `tokens`/`token`/`text` field",
+        )
+            .into_response();
+    }
+
+    let mut imported: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (idx, s) in storages.into_iter().enumerate() {
+        let label = format!("#{}", idx + 1);
+        match import_one_storage(&app, s, &label).await {
+            Ok(id) => imported.push(id),
+            Err(e) => errors.push(e),
+        }
+    }
+    let body = json!({
+        "imported": imported,
+        "errors": errors,
+    });
+    if imported.is_empty() && !errors.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+    Json(body).into_response()
+}
+
 /// 上传 codex-*.json，写入 DB（不再落 auths/ 目录；要互通调用 export 接口）。
 pub async fn upload(
     State(app): State<Arc<AppState>>,

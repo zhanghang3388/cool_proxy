@@ -16,6 +16,7 @@ use crate::state::AppState;
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/accounts", get(accounts::list).post(accounts::upload))
+        .route("/accounts/import", post(accounts::import_json))
         .route(
             "/accounts/:id",
             delete(accounts::delete_one).patch(accounts::patch_one),

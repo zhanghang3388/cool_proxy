@@ -2,14 +2,14 @@
 import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NCard, NDataTable, NSpace, NButton, NTag, NUpload, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
-  NSelect, NInput, NPagination,
+  NSelect, NInput, NPagination, NModal, NAlert,
   useMessage,
   type DataTableColumns,
   type UploadFileInfo,
 } from 'naive-ui'
 import {
   AccountView, StatsView, ProxyEntry,
-  listAccounts, uploadAccounts, deleteAccount, refreshAccount, resetCooldown,
+  listAccounts, uploadAccounts, importAccountsJson, deleteAccount, refreshAccount, resetCooldown,
   patchAccount, reloadFromDisk, exportToFiles, getStats, listProxies, setAccountProxy,
 } from '../api'
 
@@ -284,6 +284,39 @@ async function handleExport() {
     message.error((e as Error).message)
   }
 }
+
+const showPaste = ref(false)
+const pasteText = ref('')
+const pasting = ref(false)
+
+function openPaste() {
+  pasteText.value = ''
+  showPaste.value = true
+}
+
+async function submitPaste() {
+  const text = pasteText.value.trim()
+  if (!text) {
+    message.warning('请粘贴 JSON')
+    return
+  }
+  pasting.value = true
+  try {
+    const res = await importAccountsJson({ text })
+    if (res.imported.length) message.success(`导入 ${res.imported.length} 个账号`)
+    if (res.errors.length) message.warning(`错误：${res.errors.join('; ')}`)
+    if (res.imported.length) {
+      showPaste.value = false
+      await refresh()
+    }
+  } catch (e) {
+    const err = e as { response?: { data?: { errors?: string[] } }; message: string }
+    const detail = err.response?.data?.errors?.join('; ')
+    message.error(detail || err.message)
+  } finally {
+    pasting.value = false
+  }
+}
 </script>
 
 <template>
@@ -314,6 +347,7 @@ async function handleExport() {
           >
             <n-button type="primary">上传认证文件</n-button>
           </n-upload>
+          <n-button @click="openPaste">粘贴 JSON</n-button>
           <n-button @click="handleExport">导出到 auths/</n-button>
           <n-button @click="handleReload">从磁盘重新加载</n-button>
           <n-button @click="refresh" :loading="loading">手动刷新</n-button>
@@ -338,5 +372,27 @@ async function handleExport() {
         />
       </div>
     </n-card>
+
+    <n-modal v-model:show="showPaste" preset="card" title="粘贴 JSON 导入" style="width: 720px">
+      <n-space vertical :size="12">
+        <n-alert type="info" :show-icon="false">
+          支持三种格式：<br />
+          1) 单个 JSON 对象 <code>{...}</code><br />
+          2) JSON 数组 <code>[{...},{...}]</code><br />
+          3) 一行一个 JSON（JSONL）
+        </n-alert>
+        <n-input
+          v-model:value="pasteText"
+          type="textarea"
+          :autosize="{ minRows: 12, maxRows: 24 }"
+          placeholder='{"access_token":"...","refresh_token":"...","email":"a@b.c","account_id":"...","type":"codex","expired":"2026-..."}'
+          spellcheck="false"
+        />
+        <n-space justify="end">
+          <n-button @click="showPaste = false">取消</n-button>
+          <n-button type="primary" :loading="pasting" @click="submitPaste">导入</n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
   </n-space>
 </template>
