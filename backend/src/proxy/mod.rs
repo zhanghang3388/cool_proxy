@@ -727,8 +727,15 @@ pub async fn chat_completions_handler(
         }
     };
 
-    let raw: serde_json::Value =
-        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+    let raw: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+            );
+        }
+    };
     let model = raw
         .get("model")
         .and_then(|v| v.as_str())
