@@ -360,22 +360,10 @@ fn extract_upstream_path(uri: &Uri) -> Option<String> {
     Some(pq.as_str().to_string())
 }
 
-/// 项目"内置可服务"的 model 兜底列表：用于号池里没拿到任何提示信息时的 fallback。
-/// 这里只列 codex 客户端实测可用的；catalog 里有更多 slug，但不是所有都能跑。
-const FALLBACK_MODELS: &[&str] = &[
-    "gpt-5-codex",
-    "gpt-5-codex-mini",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-4.1",
-];
-
-/// 当前可服务的 model 列表：取号池里所有 enabled 且未死的账号 → 收集它们最近成功跑过的 model
-/// （记录在 account_model_states 里 last_kind=success 的行）→ union FALLBACK_MODELS。
-/// 没有任何号 → 空列表（让客户端知道 0 模型可用，比硬编一份骗它好）。
-fn available_model_ids(app: &AppState) -> Vec<String> {
-    let mut has_any = false;
-    let mut from_logs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+/// 收集当前所有 enabled 且未死的账号的 plan 字符串（去重）。空池子返回空 vec。
+fn available_account_plans(app: &AppState) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
     for id in app.pool.all_ids_sorted() {
         let Some(acc) = app.pool.get(&id) else {
             continue;
@@ -383,40 +371,34 @@ fn available_model_ids(app: &AppState) -> Vec<String> {
         if !acc.enabled || acc.access_token.is_empty() {
             continue;
         }
-        has_any = true;
-        // 从该号的 model_states 提取曾经被请求过的 model_key
-        for s in app.pool.list_model_states(&acc.id) {
-            if !s.model_key.is_empty() {
-                from_logs.insert(s.model_key);
-            }
-        }
-    }
-    if !has_any {
-        return Vec::new();
-    }
-    let mut out: Vec<String> = FALLBACK_MODELS.iter().map(|s| s.to_string()).collect();
-    for m in from_logs {
-        if !out.contains(&m) {
-            out.push(m);
+        let plan = acc.plan.clone().unwrap_or_default();
+        if seen.insert(plan.clone()) {
+            out.push(plan);
         }
     }
     out
 }
 
 fn models_list_response(app: &AppState, codex_client: bool) -> Response {
-    let ids = available_model_ids(app);
-    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let plans = available_account_plans(app);
+    let plan_refs: Vec<&str> = plans.iter().map(String::as_str).collect();
     let body = if codex_client {
-        models_catalog::build_codex_client_response(&id_refs)
+        models_catalog::build_codex_client_response(&plan_refs)
     } else {
-        models_catalog::build_simple_list(&id_refs)
+        models_catalog::build_simple_list(&plan_refs)
     };
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 fn models_get_response(app: &AppState, id: &str) -> Response {
-    let ids = available_model_ids(app);
-    if ids.iter().any(|m| m == id) {
+    let plans = available_account_plans(app);
+    let plan_refs: Vec<&str> = plans.iter().map(String::as_str).collect();
+    let list = models_catalog::build_simple_list(&plan_refs);
+    let exists = list["data"]
+        .as_array()
+        .map(|arr| arr.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id)))
+        .unwrap_or(false);
+    if exists {
         let body = serde_json::json!({
             "id": id,
             "object": "model",
