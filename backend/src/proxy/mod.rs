@@ -16,6 +16,7 @@ use crate::state::AppState;
 pub mod clients;
 pub mod error_class;
 pub mod log;
+pub mod models_catalog;
 pub use clients::ProxiedClients;
 pub use error_class::{classify, quota_backoff, ErrorKind};
 pub use log::{LogEntry, RequestLog};
@@ -106,10 +107,15 @@ pub async fn proxy_handler(
     if req.method() == Method::GET {
         let path_only = req.uri().path();
         if path_only == "/v1/models" {
-            return models_list_response();
+            let is_codex_client = req
+                .uri()
+                .query()
+                .map(|q| q.split('&').any(|p| p.starts_with("client_version=")))
+                .unwrap_or(false);
+            return models_list_response(&app, is_codex_client);
         }
         if let Some(id) = path_only.strip_prefix("/v1/models/") {
-            return models_get_response(id);
+            return models_get_response(&app, id);
         }
     }
 
@@ -353,8 +359,9 @@ fn extract_upstream_path(uri: &Uri) -> Option<String> {
     Some(pq.as_str().to_string())
 }
 
-/// 项目支持的 model 列表。新增上游模型时在这里加一行；按 codex 客户端实测的字符串原样填。
-const SUPPORTED_MODELS: &[&str] = &[
+/// 项目"内置可服务"的 model 兜底列表：用于号池里没拿到任何提示信息时的 fallback。
+/// 这里只列 codex 客户端实测可用的；catalog 里有更多 slug，但不是所有都能跑。
+const FALLBACK_MODELS: &[&str] = &[
     "gpt-5-codex",
     "gpt-5-codex-mini",
     "gpt-5",
@@ -362,29 +369,60 @@ const SUPPORTED_MODELS: &[&str] = &[
     "gpt-4.1",
 ];
 
-fn build_model_obj(id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "object": "model",
-        // 固定时间戳：codex 不暴露 created，给个稳定值让 SDK 别奇怪
-        "created": 1_700_000_000u64,
-        "owned_by": "openai",
-    })
+/// 当前可服务的 model 列表：取号池里所有 enabled 且未死的账号 → 收集它们最近成功跑过的 model
+/// （记录在 account_model_states 里 last_kind=success 的行）→ union FALLBACK_MODELS。
+/// 没有任何号 → 空列表（让客户端知道 0 模型可用，比硬编一份骗它好）。
+fn available_model_ids(app: &AppState) -> Vec<String> {
+    let mut has_any = false;
+    let mut from_logs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for id in app.pool.all_ids_sorted() {
+        let Some(acc) = app.pool.get(&id) else {
+            continue;
+        };
+        if !acc.enabled || acc.access_token.is_empty() {
+            continue;
+        }
+        has_any = true;
+        // 从该号的 model_states 提取曾经被请求过的 model_key
+        for s in app.pool.list_model_states(&acc.id) {
+            if !s.model_key.is_empty() {
+                from_logs.insert(s.model_key);
+            }
+        }
+    }
+    if !has_any {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = FALLBACK_MODELS.iter().map(|s| s.to_string()).collect();
+    for m in from_logs {
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    out
 }
 
-fn models_list_response() -> Response {
-    let data: Vec<serde_json::Value> =
-        SUPPORTED_MODELS.iter().map(|m| build_model_obj(m)).collect();
-    let body = serde_json::json!({
-        "object": "list",
-        "data": data,
-    });
+fn models_list_response(app: &AppState, codex_client: bool) -> Response {
+    let ids = available_model_ids(app);
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let body = if codex_client {
+        models_catalog::build_codex_client_response(&id_refs)
+    } else {
+        models_catalog::build_simple_list(&id_refs)
+    };
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-fn models_get_response(id: &str) -> Response {
-    if SUPPORTED_MODELS.contains(&id) {
-        (StatusCode::OK, axum::Json(build_model_obj(id))).into_response()
+fn models_get_response(app: &AppState, id: &str) -> Response {
+    let ids = available_model_ids(app);
+    if ids.iter().any(|m| m == id) {
+        let body = serde_json::json!({
+            "id": id,
+            "object": "model",
+            "created": 1_700_000_000u64,
+            "owned_by": "openai",
+        });
+        (StatusCode::OK, axum::Json(body)).into_response()
     } else {
         let body = serde_json::json!({
             "error": {
