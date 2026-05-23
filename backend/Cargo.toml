@@ -9,7 +9,7 @@ axum = { version = "0.7", features = ["multipart", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "http2", "socks"] }
 futures = "0.3"
 futures-util = "0.3"
 async-stream = "0.3"

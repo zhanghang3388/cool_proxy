@@ -120,14 +120,26 @@ impl ProxyPool {
     }
 }
 
-/// 校验代理 URL：空字符串视为"直连"，非空必须能被 reqwest 解析。
+/// 校验代理 URL：空字符串视为"直连"，非空必须能被 reqwest 解析，且 scheme 限定为
+/// http / https / socks5 / socks5h。fragment（`#xxx` 备注）会被剥掉。
 pub fn validate_proxy_url(url: &str) -> Result<String> {
-    let trimmed = url.trim();
+    let mut trimmed = url.trim();
     if trimmed.is_empty() {
         return Ok(String::new());
     }
-    let _ = reqwest::Url::parse(trimmed)
+    // 订阅工具常会在末尾加 `#中文备注`，HTTP fragment 不传输，保险起见剥掉
+    if let Some(idx) = trimmed.find('#') {
+        trimmed = &trimmed[..idx];
+    }
+    let trimmed = trimmed.trim_end();
+    let parsed = reqwest::Url::parse(trimmed)
         .with_context(|| format!("invalid proxy url: {trimmed}"))?;
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        other => anyhow::bail!(
+            "unsupported proxy scheme: {other} (only http/https/socks5/socks5h are allowed)"
+        ),
+    }
     Ok(trimmed.to_string())
 }
 
