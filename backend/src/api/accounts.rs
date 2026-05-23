@@ -315,8 +315,13 @@ async fn import_one_storage(
     mut storage: CodexTokenStorage,
     label: &str,
 ) -> Result<String, String> {
-    if storage.access_token.is_empty() || storage.refresh_token.is_empty() {
-        return Err(format!("{label}: missing access_token / refresh_token"));
+    if storage.access_token.is_empty() {
+        return Err(format!("{label}: missing access_token"));
+    }
+    if storage.refresh_token.is_empty() {
+        tracing::warn!(
+            "{label}: imported without refresh_token, will not be auto-refreshed"
+        );
     }
     let id = derive_account_id(&storage);
     if storage.proxy_url.trim().is_empty() {
@@ -416,12 +421,18 @@ pub async fn upload(
         };
         let mut storage = storage;
 
-        if storage.access_token.is_empty() || storage.refresh_token.is_empty() {
+        if storage.access_token.is_empty() {
             errors.push(format!(
-                "{}: missing access_token / refresh_token",
+                "{}: missing access_token",
                 original_name.clone().unwrap_or_else(|| "<unnamed>".into())
             ));
             continue;
+        }
+        if storage.refresh_token.is_empty() {
+            tracing::warn!(
+                "{}: imported without refresh_token, will not be auto-refreshed",
+                original_name.clone().unwrap_or_else(|| "<unnamed>".into())
+            );
         }
 
         // ID 优先用上传文件名（去掉 .json 后缀），否则按 derive_account_id 生成
