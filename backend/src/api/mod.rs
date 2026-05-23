@@ -3,6 +3,7 @@ pub mod auth;
 pub mod logs;
 pub mod proxies;
 pub mod stats;
+pub mod usage;
 
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/accounts/:id/reset-cooldown", post(accounts::reset_cooldown))
         .route("/accounts/:id/proxy", put(accounts::set_proxy))
         .route("/accounts/reload", post(accounts::reload))
+        .route("/accounts/export", post(accounts::export_to_files))
         .route("/proxies", get(proxies::list).post(proxies::create))
         .route(
             "/proxies/:id",
@@ -30,6 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/proxies/rebalance", post(proxies::rebalance))
         .route("/stats", get(stats::overview))
+        .route("/usage", get(usage::report))
         .route("/config", get(stats::current_config))
         .route("/logs", get(logs::list).delete(logs::clear))
         .route_layer(axum::middleware::from_fn_with_state(

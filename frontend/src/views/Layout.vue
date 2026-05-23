@@ -11,6 +11,7 @@ const menu = [
   { label: '账号管理', key: 'accounts' },
   { label: '代理池', key: 'proxies' },
   { label: '请求日志', key: 'logs' },
+  { label: '用量统计', key: 'usage' },
   { label: '设置', key: 'settings' },
 ]
 

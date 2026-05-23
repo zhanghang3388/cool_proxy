@@ -1,85 +1,60 @@
-use std::collections::VecDeque;
-use std::sync::RwLock;
-
 use axum::http::Method;
-use chrono::{DateTime, Utc};
-use serde::Serialize;
+use chrono::Utc;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct LogEntry {
-    pub id: u64,
-    pub at: DateTime<Utc>,
-    pub method: String,
-    pub path: String,
-    pub account_id: Option<String>,
-    pub status: u16,
-    pub duration_ms: u64,
-    pub attempts: u32,
-    pub error: Option<String>,
-}
+use crate::store::requests as store_requests;
+pub use crate::store::requests::RequestRow as LogEntry;
+use crate::store::SqlitePool;
 
+/// 请求日志：DB 主，重启不丢。
 pub struct RequestLog {
-    capacity: usize,
-    inner: RwLock<Inner>,
-}
-
-struct Inner {
-    entries: VecDeque<LogEntry>,
-    next_id: u64,
+    db: SqlitePool,
 }
 
 impl RequestLog {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            inner: RwLock::new(Inner {
-                entries: VecDeque::with_capacity(capacity.max(1)),
-                next_id: 1,
-            }),
-        }
+    pub fn new(db: SqlitePool) -> Self {
+        Self { db }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push(
         &self,
         method: &Method,
         path: &str,
         account_id: Option<String>,
+        model: Option<String>,
         status: u16,
         duration_ms: u64,
         attempts: u32,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        total_tokens: Option<i64>,
         error: Option<String>,
     ) {
-        let mut g = self.inner.write().unwrap();
-        let id = g.next_id;
-        g.next_id = g.next_id.wrapping_add(1);
-        let entry = LogEntry {
-            id,
-            at: Utc::now(),
-            method: method.as_str().to_string(),
-            path: path.to_string(),
-            account_id,
+        let now = Utc::now().timestamp_millis();
+        let r = store_requests::InsertRequest {
+            at_ms: now,
+            account_id: account_id.as_deref(),
+            model: model.as_deref(),
+            method: method.as_str(),
+            path,
             status,
             duration_ms,
             attempts,
-            error,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            error: error.as_deref(),
         };
-        if g.entries.len() == self.capacity {
-            g.entries.pop_front();
+        if let Err(e) = store_requests::insert(&self.db, &r) {
+            tracing::warn!("request log insert failed: {e:?}");
         }
-        g.entries.push_back(entry);
     }
 
-    pub fn snapshot(&self, limit: usize) -> Vec<LogEntry> {
-        let g = self.inner.read().unwrap();
-        g.entries
-            .iter()
-            .rev()
-            .take(limit.min(g.entries.len()))
-            .cloned()
-            .collect()
+    pub fn snapshot(&self, limit: usize, before_id: Option<i64>) -> Vec<LogEntry> {
+        store_requests::list_recent(&self.db, limit as i64, before_id).unwrap_or_default()
     }
 
     pub fn clear(&self) {
-        self.inner.write().unwrap().entries.clear();
+        let _ = store_requests::clear_before(&self.db, None);
     }
 }

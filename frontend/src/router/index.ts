@@ -16,6 +16,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'accounts', name: 'accounts', component: () => import('../views/Accounts.vue') },
       { path: 'proxies', name: 'proxies', component: () => import('../views/Proxies.vue') },
       { path: 'logs', name: 'logs', component: () => import('../views/Logs.vue') },
+      { path: 'usage', name: 'usage', component: () => import('../views/Usage.vue') },
       { path: 'settings', name: 'settings', component: () => import('../views/Settings.vue') },
     ],
   },

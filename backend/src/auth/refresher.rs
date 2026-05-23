@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::CodexTokenStorage;
 use crate::config::Config;
@@ -77,7 +77,7 @@ impl Refresher {
     }
 }
 
-/// 后台任务：周期扫号池，刷新即将过期的 token。
+/// 后台任务：周期扫号池，刷新即将过期的 token。直接写 DB（pool.update_after_refresh），不再落文件。
 pub async fn run_refresh_loop(
     cfg: Arc<Config>,
     pool: Arc<AccountPool>,
@@ -94,13 +94,9 @@ pub async fn run_refresh_loop(
             continue;
         }
         debug!("refresh scan: {} candidate(s)", candidates.len());
-        for (id, storage, path, proxy_url) in candidates {
+        for (id, storage, _path, proxy_url) in candidates {
             match refresher.refresh(&storage, &proxy_url).await {
                 Ok(new_storage) => {
-                    if let Err(e) = new_storage.save(&path) {
-                        error!(account = %id, "save refreshed token failed: {e:?}");
-                        continue;
-                    }
                     pool.update_after_refresh(&id, &new_storage);
                     info!(account = %id, email = %new_storage.email, "token refreshed");
                 }

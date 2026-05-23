@@ -117,6 +117,11 @@ pub async fn proxy_handler(
     let mut last_account: Option<String> = None;
     let started = Instant::now();
 
+    // 从请求体里提一下 model 字段，便于日志归类（解析失败就为 None）
+    let model: Option<String> = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
+
     for attempt in 0..max_attempts {
         let selected = match app.pool.pick() {
             Ok(s) => s,
@@ -125,9 +130,13 @@ pub async fn proxy_handler(
                     &parts.method,
                     &upstream_path,
                     None,
+                    model.clone(),
                     503,
                     started.elapsed().as_millis() as u64,
                     attempt + 1,
+                    None,
+                    None,
+                    None,
                     Some("no accounts".into()),
                 );
                 return (
@@ -141,15 +150,24 @@ pub async fn proxy_handler(
                     &parts.method,
                     &upstream_path,
                     None,
+                    model.clone(),
                     503,
                     started.elapsed().as_millis() as u64,
                     attempt + 1,
+                    None,
+                    None,
+                    None,
                     Some("all unavailable".into()),
                 );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "all accounts cooling down or disabled",
                 )
+                    .into_response();
+            }
+            Err(PoolError::Db(e)) => {
+                error!("pick from db failed: {e:?}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
                     .into_response();
             }
         };
@@ -177,30 +195,56 @@ pub async fn proxy_handler(
         .await;
 
         match res {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 let status = resp.status();
                 if status.is_success() || status == StatusCode::NOT_MODIFIED {
                     app.pool.report_success(&selected.id);
-                    app.request_log.push(
-                        &parts.method,
-                        &upstream_path,
-                        Some(selected.id.clone()),
-                        status.as_u16(),
-                        started.elapsed().as_millis() as u64,
-                        attempt + 1,
-                        None,
-                    );
+                    // 把响应体包一层 tee：边转发边累积尾部 32KB，stream 完了解析 usage 写库
+                    let original_body = std::mem::replace(resp.body_mut(), Body::empty());
+                    let log = app.request_log.clone();
+                    let method = parts.method.clone();
+                    let path_log = upstream_path.clone();
+                    let acct_id = selected.id.clone();
+                    let model_l = model.clone();
+                    let status_code = status.as_u16();
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let attempts_n = attempt + 1;
+                    let teed = tee_usage(original_body, move |tail| {
+                        let (input, output, total) = parse_usage(&tail);
+                        log.push(
+                            &method,
+                            &path_log,
+                            Some(acct_id),
+                            model_l,
+                            status_code,
+                            elapsed_ms,
+                            attempts_n,
+                            input,
+                            output,
+                            total,
+                            None,
+                        );
+                    });
+                    *resp.body_mut() = teed;
                     return resp;
                 }
                 if should_retry(status) {
-                    let snippet = "(see upstream body)";
+                    // 失败响应不会再返给下游，先吃掉前几百字节作为 last_error，便于面板排查
+                    let body = std::mem::replace(resp.body_mut(), Body::empty());
+                    let snippet = match axum::body::to_bytes(body, 4 * 1024).await {
+                        Ok(b) if !b.is_empty() => {
+                            let s = String::from_utf8_lossy(&b).into_owned();
+                            truncate_snippet(&s, 300)
+                        }
+                        _ => format!("upstream {status}"),
+                    };
                     warn!(
                         account = %selected.id,
                         status = %status,
                         "request failed, will retry with another account"
                     );
-                    app.pool.report_failure(&selected.id, status.as_u16(), snippet);
-                    last_error = Some((status, format!("upstream {status}")));
+                    app.pool.report_failure(&selected.id, status.as_u16(), &snippet);
+                    last_error = Some((status, format!("upstream {status}: {snippet}")));
                     continue;
                 }
                 // 4xx 客户端错误（不是账号问题）直接返给调用方
@@ -208,9 +252,13 @@ pub async fn proxy_handler(
                     &parts.method,
                     &upstream_path,
                     Some(selected.id.clone()),
+                    model.clone(),
                     status.as_u16(),
                     started.elapsed().as_millis() as u64,
                     attempt + 1,
+                    None,
+                    None,
+                    None,
                     None,
                 );
                 return resp;
@@ -237,9 +285,13 @@ pub async fn proxy_handler(
         &parts.method,
         &upstream_path,
         last_account,
+        model,
         status.as_u16(),
         started.elapsed().as_millis() as u64,
         max_attempts,
+        None,
+        None,
+        None,
         Some(msg.clone()),
     );
     (status, msg).into_response()
@@ -256,6 +308,117 @@ fn should_retry(status: StatusCode) -> bool {
         status.as_u16(),
         401 | 403 | 408 | 425 | 429 | 500 | 502 | 503 | 504
     )
+}
+
+/// 把上游错误体做成可读的简短 snippet，去掉换行、限制长度，避免日志/UI 里塞进 KB 级内容。
+fn truncate_snippet(raw: &str, max: usize) -> String {
+    let collapsed: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = collapsed.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max).collect();
+    out.push_str("...");
+    out
+}
+
+/// SSE / JSON 响应体里挖 usage：保留尾部 32KB（够覆盖 response.completed），
+/// stream 结束时把尾部交给回调。回调里只允许做轻量 JSON 解析 + DB 写入。
+fn tee_usage<F>(body: Body, on_done: F) -> Body
+where
+    F: FnOnce(bytes::BytesMut) + Send + 'static,
+{
+    use futures_util::stream::StreamExt;
+    const TAIL_CAP: usize = 32 * 1024;
+    let mut tail = bytes::BytesMut::with_capacity(TAIL_CAP);
+    let mut stream = body.into_data_stream();
+    let mut callback = Some(on_done);
+    let s = async_stream::stream! {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    // 累积尾部，超过 cap 就丢掉前面的（usage 一定在最后一个 SSE 事件里）
+                    if tail.len() + b.len() > TAIL_CAP {
+                        let drop = tail.len() + b.len() - TAIL_CAP;
+                        let drop = drop.min(tail.len());
+                        let _ = tail.split_to(drop);
+                    }
+                    if b.len() >= TAIL_CAP {
+                        tail.clear();
+                        let start = b.len() - TAIL_CAP;
+                        tail.extend_from_slice(&b[start..]);
+                    } else {
+                        tail.extend_from_slice(&b);
+                    }
+                    yield Ok::<_, std::io::Error>(b);
+                }
+                Err(e) => {
+                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                    break;
+                }
+            }
+        }
+        if let Some(cb) = callback.take() {
+            cb(tail);
+        }
+    };
+    Body::from_stream(s)
+}
+
+/// 从尾部 bytes 里解析 codex `/responses` 的 usage 字段。
+/// 流式：寻找最后一个 `data: {...}` 里的 `response.usage` 或 `usage`；
+/// 非流式 JSON：直接当 JSON 解析根级。
+/// 返回 (input_tokens, output_tokens, total_tokens)，任何字段缺失则该字段为 None。
+fn parse_usage(tail: &[u8]) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let s = std::str::from_utf8(tail).unwrap_or("");
+    if s.is_empty() {
+        return (None, None, None);
+    }
+    // 1) 尝试整体 JSON（非流式 / 完整短响应）
+    if let Some(u) = extract_usage_from_json_str(s) {
+        return u;
+    }
+    // 2) SSE：从后往前找最近的 data: 行
+    for line in s.lines().rev() {
+        let line = line.trim_start();
+        let payload = line.strip_prefix("data:").map(|p| p.trim_start());
+        if let Some(p) = payload {
+            if p.starts_with('{') {
+                if let Some(u) = extract_usage_from_json_str(p) {
+                    return u;
+                }
+            }
+        }
+    }
+    (None, None, None)
+}
+
+fn extract_usage_from_json_str(s: &str) -> Option<(Option<i64>, Option<i64>, Option<i64>)> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    // codex 流式 response.completed: {"response": {"usage": {...}}}
+    let usage = v
+        .get("response")
+        .and_then(|r| r.get("usage"))
+        .or_else(|| v.get("usage"))?;
+    let input = usage
+        .get("input_tokens")
+        .and_then(|x| x.as_i64())
+        .or_else(|| usage.get("prompt_tokens").and_then(|x| x.as_i64()));
+    let output = usage
+        .get("output_tokens")
+        .and_then(|x| x.as_i64())
+        .or_else(|| usage.get("completion_tokens").and_then(|x| x.as_i64()));
+    let total = usage
+        .get("total_tokens")
+        .and_then(|x| x.as_i64())
+        .or_else(|| match (input, output) {
+            (Some(i), Some(o)) => Some(i + o),
+            _ => None,
+        });
+    Some((input, output, total))
 }
 
 #[allow(clippy::too_many_arguments)]

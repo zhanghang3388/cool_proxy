@@ -13,7 +13,7 @@ let timer: number | null = null
 
 async function refresh() {
   try {
-    logs.value = await listLogs(200)
+    logs.value = await listLogs({ limit: 200 })
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -60,27 +60,45 @@ function statusType(s: number): 'success' | 'warning' | 'error' | 'default' {
 const columns = computed<DataTableColumns<LogEntry>>(() => [
   { title: '时间', key: 'at', width: 170, render: (r) => fmtTime(r.at) },
   { title: '方法', key: 'method', width: 70 },
-  { title: '路径', key: 'path', minWidth: 240, ellipsis: { tooltip: true } },
+  { title: '路径', key: 'path', minWidth: 200, ellipsis: { tooltip: true } },
+  {
+    title: '模型',
+    key: 'model',
+    width: 130,
+    ellipsis: { tooltip: true },
+    render: (r) => r.model ?? '-',
+  },
   {
     title: '账号',
     key: 'account_id',
-    width: 220,
+    width: 200,
     ellipsis: { tooltip: true },
     render: (r) => r.account_id ?? '-',
   },
   {
     title: '状态',
     key: 'status',
-    width: 90,
+    width: 80,
     render: (r) =>
       h(NTag, { type: statusType(r.status), size: 'small' }, { default: () => r.status }),
+  },
+  {
+    title: 'in / out / total',
+    key: 'tokens',
+    width: 150,
+    render: (r) => {
+      const i = r.input_tokens ?? '-'
+      const o = r.output_tokens ?? '-'
+      const t = r.total_tokens ?? '-'
+      return `${i} / ${o} / ${t}`
+    },
   },
   { title: '耗时(ms)', key: 'duration_ms', width: 100 },
   { title: '尝试', key: 'attempts', width: 70 },
   {
     title: '错误',
     key: 'error',
-    minWidth: 200,
+    minWidth: 180,
     ellipsis: { tooltip: true },
     render: (r) => r.error ?? '-',
   },
@@ -116,7 +134,7 @@ async function doClear() {
       :columns="columns"
       :data="logs"
       :row-key="(r: LogEntry) => r.id"
-      :scroll-x="1200"
+      :scroll-x="1480"
       size="small"
       :bordered="false"
     />

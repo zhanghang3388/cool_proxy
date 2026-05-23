@@ -14,6 +14,9 @@ use crate::state::AppState;
 pub struct LogsQuery {
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// 加载更多：传上一页最小 id，返回 id < before_id 的记录
+    #[serde(default)]
+    pub before_id: Option<i64>,
 }
 
 fn default_limit() -> usize {
@@ -24,7 +27,7 @@ pub async fn list(
     State(app): State<Arc<AppState>>,
     Query(q): Query<LogsQuery>,
 ) -> Json<Vec<LogEntry>> {
-    Json(app.request_log.snapshot(q.limit.clamp(1, 1000)))
+    Json(app.request_log.snapshot(q.limit.clamp(1, 1000), q.before_id))
 }
 
 pub async fn clear(State(app): State<Arc<AppState>>) -> Response {

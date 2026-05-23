@@ -25,9 +25,13 @@ const onlyUnassigned = ref(true)
 
 async function refresh() {
   try {
-    const [p, a] = await Promise.all([listProxies(), listAccounts()])
+    const [p, a] = await Promise.all([
+      listProxies(),
+      // 这里只是为了显示"每个代理被多少号绑定"的概览，最多取 1000 条够用
+      listAccounts({ limit: 1000, offset: 0 }),
+    ])
     proxies.value = p
-    accounts.value = a
+    accounts.value = a.items
   } catch (e) {
     message.error((e as Error).message)
   }

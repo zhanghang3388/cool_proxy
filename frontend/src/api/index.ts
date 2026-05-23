@@ -14,10 +14,16 @@ export interface AccountView {
   last_error: string | null
   total_requests: number
   total_failures: number
-  file_path: string
   expired: boolean
   proxy_url: string
   proxy_id: string | null
+}
+
+export interface AccountListResp {
+  total: number
+  items: AccountView[]
+  limit: number
+  offset: number
 }
 
 export interface ProxyEntry {
@@ -39,10 +45,31 @@ export interface LogEntry {
   method: string
   path: string
   account_id: string | null
+  model: string | null
   status: number
   duration_ms: number
   attempts: number
+  input_tokens: number | null
+  output_tokens: number | null
+  total_tokens: number | null
   error: string | null
+}
+
+export interface UsageBucket {
+  key: string
+  count: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+}
+
+export interface UsageReport {
+  total_count: number
+  total_input_tokens: number
+  total_output_tokens: number
+  total_total_tokens: number
+  by_model: UsageBucket[]
+  by_account: UsageBucket[]
 }
 
 export interface StatsView {
@@ -81,8 +108,10 @@ function buildClient(): AxiosInstance {
 
 const http = buildClient()
 
-export async function listAccounts(): Promise<AccountView[]> {
-  const { data } = await http.get<AccountView[]>('/accounts')
+export async function listAccounts(
+  params: { limit?: number; offset?: number; q?: string } = {},
+): Promise<AccountListResp> {
+  const { data } = await http.get<AccountListResp>('/accounts', { params })
   return data
 }
 
@@ -112,6 +141,18 @@ export async function reloadFromDisk(): Promise<{ count: number }> {
   return data
 }
 
+export async function exportToFiles(): Promise<{ written: number; errors: string[] }> {
+  const { data } = await http.post('/accounts/export')
+  return data
+}
+
+export async function getUsage(
+  params: { from_ms?: number; to_ms?: number } = {},
+): Promise<UsageReport> {
+  const { data } = await http.get<UsageReport>('/usage', { params })
+  return data
+}
+
 export async function getStats(): Promise<StatsView> {
   const { data } = await http.get<StatsView>('/stats')
   return data
@@ -122,8 +163,10 @@ export async function getRuntimeConfig(): Promise<Record<string, unknown>> {
   return data
 }
 
-export async function listLogs(limit = 200): Promise<LogEntry[]> {
-  const { data } = await http.get<LogEntry[]>('/logs', { params: { limit } })
+export async function listLogs(
+  params: { limit?: number; before_id?: number } = {},
+): Promise<LogEntry[]> {
+  const { data } = await http.get<LogEntry[]>('/logs', { params })
   return data
 }
 

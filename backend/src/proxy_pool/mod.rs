@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+
+use crate::store::proxies as store_proxies;
+use crate::store::SqlitePool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyEntry {
@@ -16,144 +17,121 @@ pub struct ProxyEntry {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProxyPoolFile {
-    #[serde(default)]
-    pub proxies: Vec<ProxyEntry>,
-    /// 累计分配过的次数，用于决定下一个新账号绑定哪个代理。
-    /// 永远递增，不随删除回退，避免删除后再加导致分布偏斜。
-    #[serde(default)]
-    pub assign_counter: u64,
+impl From<store_proxies::ProxyRow> for ProxyEntry {
+    fn from(r: store_proxies::ProxyRow) -> Self {
+        Self {
+            id: r.id,
+            url: r.url,
+            label: r.label,
+            created_at: Utc.timestamp_millis_opt(r.created_at).single(),
+        }
+    }
 }
 
+/// 代理池：DB 主，handler 接口保持原状。
 pub struct ProxyPool {
-    path: PathBuf,
-    inner: RwLock<ProxyPoolFile>,
+    db: SqlitePool,
 }
 
 impl ProxyPool {
-    pub fn load(path: PathBuf) -> Result<Self> {
-        let inner = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("read proxy pool {:?}", path))?;
-            serde_json::from_str(&raw).with_context(|| "parse proxy pool")?
-        } else {
-            ProxyPoolFile::default()
-        };
-        Ok(Self {
-            path,
-            inner: RwLock::new(inner),
-        })
+    pub fn new(db: SqlitePool) -> Self {
+        Self { db }
     }
 
-    fn save_locked(&self, file: &ProxyPoolFile) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+    /// 启动时若 DB 为空且老 proxies.json 存在，做一次性导入。
+    pub fn import_legacy_if_empty(&self, legacy_path: &Path) -> Result<()> {
+        let existing = store_proxies::list(&self.db)?;
+        if !existing.is_empty() {
+            return Ok(());
         }
-        let tmp = self.path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(file)?;
-        std::fs::write(&tmp, &data)?;
-        std::fs::rename(&tmp, &self.path)?;
+        if !legacy_path.exists() {
+            return Ok(());
+        }
+        let raw = std::fs::read_to_string(legacy_path)
+            .with_context(|| format!("read legacy proxies {:?}", legacy_path))?;
+        #[derive(Deserialize)]
+        struct LegacyFile {
+            #[serde(default)]
+            proxies: Vec<LegacyEntry>,
+        }
+        #[derive(Deserialize)]
+        struct LegacyEntry {
+            url: String,
+            #[serde(default)]
+            label: String,
+        }
+        let parsed: LegacyFile =
+            serde_json::from_str(&raw).with_context(|| "parse legacy proxies.json")?;
+        for e in parsed.proxies {
+            // 忽略重复，老文件可能本来就乱
+            let _ = store_proxies::add(&self.db, e.url, e.label);
+        }
+        tracing::info!("imported legacy proxies.json");
         Ok(())
     }
 
     pub fn list(&self) -> Vec<ProxyEntry> {
-        self.inner.read().unwrap().proxies.clone()
+        store_proxies::list(&self.db)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     pub fn url_by_id(&self, id: &str) -> Option<String> {
-        self.inner
-            .read()
-            .unwrap()
-            .proxies
-            .iter()
-            .find(|p| p.id == id)
-            .map(|p| p.url.clone())
+        store_proxies::url_by_id(&self.db, id).ok().flatten()
     }
 
     pub fn id_by_url(&self, url: &str) -> Option<String> {
-        let url = url.trim();
-        if url.is_empty() {
-            return None;
-        }
-        self.inner
-            .read()
-            .unwrap()
-            .proxies
-            .iter()
-            .find(|p| p.url == url)
-            .map(|p| p.id.clone())
+        store_proxies::id_by_url(&self.db, url).ok().flatten()
     }
 
     pub fn add(&self, url: String, label: String) -> Result<ProxyEntry> {
-        let url = url.trim().to_string();
+        let url = validate_proxy_url(&url)?;
         if url.is_empty() {
             anyhow::bail!("url must not be empty");
         }
-        // 简单校验：必须看起来像一个 URL
-        let _ = reqwest::Url::parse(&url).with_context(|| format!("invalid url: {url}"))?;
-
-        let mut g = self.inner.write().unwrap();
-        if g.proxies.iter().any(|p| p.url == url) {
-            anyhow::bail!("proxy already exists");
-        }
-        let entry = ProxyEntry {
-            id: format!("px_{}", &Uuid::new_v4().simple().to_string()[..12]),
-            url,
-            label,
-            created_at: Some(Utc::now()),
-        };
-        g.proxies.push(entry.clone());
-        self.save_locked(&g)?;
-        Ok(entry)
+        let row = store_proxies::add(&self.db, url, label)?;
+        Ok(row.into())
     }
 
     pub fn update(&self, id: &str, url: Option<String>, label: Option<String>) -> Result<()> {
-        let mut g = self.inner.write().unwrap();
-        let Some(p) = g.proxies.iter_mut().find(|p| p.id == id) else {
-            anyhow::bail!("proxy not found");
-        };
-        if let Some(u) = url {
-            let u = u.trim().to_string();
-            if u.is_empty() {
-                anyhow::bail!("url must not be empty");
+        let url = match url {
+            Some(u) => {
+                let v = validate_proxy_url(&u)?;
+                if v.is_empty() {
+                    anyhow::bail!("url must not be empty");
+                }
+                Some(v)
             }
-            let _ = reqwest::Url::parse(&u).with_context(|| format!("invalid url: {u}"))?;
-            p.url = u;
-        }
-        if let Some(l) = label {
-            p.label = l;
-        }
-        self.save_locked(&g)
+            None => None,
+        };
+        store_proxies::update(&self.db, id, url, label)?;
+        Ok(())
     }
 
     pub fn remove(&self, id: &str) -> Result<bool> {
-        let mut g = self.inner.write().unwrap();
-        let len_before = g.proxies.len();
-        g.proxies.retain(|p| p.id != id);
-        let removed = g.proxies.len() != len_before;
-        if removed {
-            self.save_locked(&g)?;
-        }
-        Ok(removed)
+        store_proxies::delete(&self.db, id)
     }
 
-    /// round-robin 拿下一个代理 URL，返回 (id, url)。空池返回 None。
+    /// round-robin 给新账号分配代理。
     pub fn next_assignment(&self) -> Option<(String, String)> {
-        let mut g = self.inner.write().unwrap();
-        if g.proxies.is_empty() {
-            return None;
-        }
-        let idx = (g.assign_counter as usize) % g.proxies.len();
-        g.assign_counter = g.assign_counter.wrapping_add(1);
-        let p = &g.proxies[idx];
-        let pair = (p.id.clone(), p.url.clone());
-        let _ = self.save_locked(&g);
-        Some(pair)
+        store_proxies::next_assignment(&self.db).ok().flatten()
     }
 }
 
-/// 默认的代理池文件路径：放在 auth_dir 下，方便和认证文件一起打包/迁移
-pub fn default_pool_path(auth_dir: &Path) -> PathBuf {
+/// 校验代理 URL：空字符串视为"直连"，非空必须能被 reqwest 解析。
+pub fn validate_proxy_url(url: &str) -> Result<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let _ = reqwest::Url::parse(trimmed)
+        .with_context(|| format!("invalid proxy url: {trimmed}"))?;
+    Ok(trimmed.to_string())
+}
+
+/// 保留这个路径，用于一次性把老 proxies.json 导入 DB。导入完不再写。
+pub fn legacy_pool_path(auth_dir: &Path) -> PathBuf {
     auth_dir.join("proxies.json")
 }

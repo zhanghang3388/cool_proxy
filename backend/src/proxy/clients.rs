@@ -32,8 +32,8 @@ impl ProxiedClients {
         }
         let client = build_client(if key.is_empty() { None } else { Some(key) })?;
         let mut g = self.inner.write().unwrap();
-        g.entry(key.to_string()).or_insert_with(|| client.clone());
-        Ok(client)
+        // 并发场景下别人可能已经先插入了，统一返回 map 里实际存的那个
+        Ok(g.entry(key.to_string()).or_insert(client).clone())
     }
 
     /// 删除某条代理对应的连接池缓存（在用户删除/编辑代理时调用，避免脏连接）。

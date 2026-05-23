@@ -5,6 +5,7 @@ mod pool;
 mod proxy;
 mod proxy_pool;
 mod state;
+mod store;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +19,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::auth::refresher::run_refresh_loop;
 use crate::config::Config;
-use crate::pool::AccountPool;
 use crate::state::AppState;
 
 #[tokio::main]
@@ -49,15 +49,12 @@ async fn main() -> anyhow::Result<()> {
     info!("cool_proxy starting on {}", config.bind_addr());
 
     let config = Arc::new(config);
-    let pool = Arc::new(AccountPool::new(config.clone()));
-    pool.load_from_disk()?;
-
-    let state = Arc::new(AppState::new(config.clone(), pool.clone())?);
+    let state = Arc::new(AppState::new(config.clone())?);
 
     // 后台 token 刷新
     {
         let cfg = config.clone();
-        let p = pool.clone();
+        let p = state.pool.clone();
         let r = state.refresher.clone();
         tokio::spawn(run_refresh_loop(cfg, p, r));
     }

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NCard, NDataTable, NSpace, NButton, NTag, NUpload, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
-  NSelect,
+  NSelect, NInput, NPagination,
   useMessage,
   type DataTableColumns,
   type UploadFileInfo,
@@ -10,7 +10,7 @@ import {
 import {
   AccountView, StatsView, ProxyEntry,
   listAccounts, uploadAccounts, deleteAccount, refreshAccount, resetCooldown,
-  patchAccount, reloadFromDisk, getStats, listProxies, setAccountProxy,
+  patchAccount, reloadFromDisk, exportToFiles, getStats, listProxies, setAccountProxy,
 } from '../api'
 
 const accounts = ref<AccountView[]>([])
@@ -19,18 +19,40 @@ const stats = ref<StatsView | null>(null)
 const loading = ref(false)
 const message = useMessage()
 
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
+const search = ref('')
+
 let timer: number | null = null
+let searchTimer: number | null = null
 
 async function refresh() {
   try {
-    const [list, s, p] = await Promise.all([listAccounts(), getStats(), listProxies()])
-    accounts.value = list
+    const offset = (page.value - 1) * pageSize.value
+    const q = search.value.trim() || undefined
+    const [list, s, p] = await Promise.all([
+      listAccounts({ limit: pageSize.value, offset, q }),
+      getStats(),
+      listProxies(),
+    ])
+    accounts.value = list.items
+    total.value = list.total
     stats.value = s
     proxies.value = p
   } catch (e) {
     message.error(`加载失败：${(e as Error).message}`)
   }
 }
+
+watch([page, pageSize], refresh)
+watch(search, () => {
+  if (searchTimer) window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(() => {
+    page.value = 1
+    refresh()
+  }, 300)
+})
 
 onMounted(async () => {
   loading.value = true
@@ -40,6 +62,7 @@ onMounted(async () => {
 })
 onUnmounted(() => {
   if (timer) window.clearInterval(timer)
+  if (searchTimer) window.clearTimeout(searchTimer)
 })
 
 function fmtTime(s: string | null): string {
@@ -95,7 +118,6 @@ const columns = computed<DataTableColumns<AccountView>>(() => [
           value: p.id,
         })),
       ]
-      // 账号绑定的 url 不在代理池里时（被删除过），显示成自定义
       const known = !row.proxy_url || row.proxy_id !== null
       if (!known) {
         opts.push({ label: `自定义 (${row.proxy_url})`, value: '__custom__' })
@@ -187,7 +209,7 @@ const columns = computed<DataTableColumns<AccountView>>(() => [
             NPopconfirm,
             { onPositiveClick: () => doDelete(row.id) },
             {
-              default: () => '确定删除该账号？认证文件也会被删除。',
+              default: () => '确定删除该账号？',
               trigger: () =>
                 h(NButton, { size: 'small', type: 'error', ghost: true }, { default: () => '删除' }),
             },
@@ -251,6 +273,17 @@ async function handleReload() {
     message.error((e as Error).message)
   }
 }
+
+async function handleExport() {
+  try {
+    const r = await exportToFiles()
+    let msg = `已导出 ${r.written} 个账号到 auths/`
+    if (r.errors.length) msg += `；错误：${r.errors.join('; ')}`
+    message.success(msg)
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
 </script>
 
 <template>
@@ -265,6 +298,13 @@ async function handleReload() {
     <n-card title="账号列表">
       <template #header-extra>
         <n-space>
+          <n-input
+            v-model:value="search"
+            placeholder="按邮箱 / id 搜索"
+            clearable
+            style="width: 240px"
+            size="small"
+          />
           <n-upload
             multiple
             :show-file-list="false"
@@ -274,6 +314,7 @@ async function handleReload() {
           >
             <n-button type="primary">上传认证文件</n-button>
           </n-upload>
+          <n-button @click="handleExport">导出到 auths/</n-button>
           <n-button @click="handleReload">从磁盘重新加载</n-button>
           <n-button @click="refresh" :loading="loading">手动刷新</n-button>
         </n-space>
@@ -286,6 +327,16 @@ async function handleReload() {
         :scroll-x="1620"
         size="small"
       />
+      <div style="margin-top: 12px; display: flex; justify-content: flex-end">
+        <n-pagination
+          v-model:page="page"
+          v-model:page-size="pageSize"
+          :item-count="total"
+          :page-sizes="[20, 50, 100, 200]"
+          show-size-picker
+          show-quick-jumper
+        />
+      </div>
     </n-card>
   </n-space>
 </template>

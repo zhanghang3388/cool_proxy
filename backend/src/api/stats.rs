@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use serde_json::json;
@@ -17,37 +19,19 @@ pub struct StatsView {
     pub total_failures: u64,
 }
 
-pub async fn overview(State(app): State<Arc<AppState>>) -> Json<StatsView> {
-    let now = chrono::Utc::now();
-    let accounts = app.pool.list();
-    let mut total_requests = 0u64;
-    let mut total_failures = 0u64;
-    let mut enabled = 0usize;
-    let mut cooling = 0usize;
-    let mut expired = 0usize;
-    for a in &accounts {
-        total_requests = total_requests.saturating_add(a.total_requests);
-        total_failures = total_failures.saturating_add(a.total_failures);
-        if a.enabled {
-            enabled += 1;
-        }
-        if let Some(t) = a.cooldown_until {
-            if t > now {
-                cooling += 1;
-            }
-        }
-        if a.expire_at.map(|t| t <= now).unwrap_or(true) {
-            expired += 1;
-        }
+pub async fn overview(State(app): State<Arc<AppState>>) -> Response {
+    match app.pool.stats_overview() {
+        Ok(s) => Json(StatsView {
+            total_accounts: s.total,
+            enabled_accounts: s.enabled,
+            cooling_down: s.cooling,
+            expired: s.expired,
+            total_requests: s.total_requests,
+            total_failures: s.total_failures,
+        })
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
-    Json(StatsView {
-        total_accounts: accounts.len(),
-        enabled_accounts: enabled,
-        cooling_down: cooling,
-        expired,
-        total_requests,
-        total_failures,
-    })
 }
 
 pub async fn current_config(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
