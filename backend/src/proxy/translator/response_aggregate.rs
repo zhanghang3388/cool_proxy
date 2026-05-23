@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
-use super::response_stream::mapped_usage;
+use super::response_stream::{mapped_usage, mime_from_codex_format};
 use super::tool_names::build_reverse_map_from_openai;
 
 /// 非流式聚合器：把 codex 的 SSE 流喂进来，结束后调用 `finalize` 拿到一个完整的
@@ -20,6 +21,8 @@ pub struct Aggregator {
     short_name_to_orig: HashMap<String, String>,
     last_usage: Option<Value>,
     completed: bool,
+    seen_images: HashMap<String, [u8; 32]>,
+    images: Vec<Value>,
 }
 
 #[derive(Default)]
@@ -43,6 +46,8 @@ impl Aggregator {
             short_name_to_orig: build_reverse_map_from_openai(original_openai_body),
             last_usage: None,
             completed: false,
+            seen_images: HashMap::new(),
+            images: Vec::new(),
         }
     }
 
@@ -145,11 +150,85 @@ impl Aggregator {
                     }
                 }
             }
+            "response.image_generation_call.partial_image" => {
+                let item_id = codex_event
+                    .get("item_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let b64 = codex_event
+                    .get("partial_image_b64")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if b64.is_empty() {
+                    return;
+                }
+                if !item_id.is_empty() && self.image_seen(&item_id, b64) {
+                    return;
+                }
+                let mime = mime_from_codex_format(
+                    codex_event
+                        .get("output_format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                self.images.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{mime};base64,{b64}")},
+                }));
+            }
+            "response.output_item.done" => {
+                let item = codex_event.get("item");
+                let item_type = item
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if item_type != "image_generation_call" {
+                    return;
+                }
+                let item_id = item
+                    .and_then(|i| i.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let b64 = item
+                    .and_then(|i| i.get("result"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if b64.is_empty() {
+                    return;
+                }
+                if !item_id.is_empty() && self.image_seen(&item_id, b64) {
+                    return;
+                }
+                let mime = mime_from_codex_format(
+                    item.and_then(|i| i.get("output_format"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                self.images.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{mime};base64,{b64}")},
+                }));
+            }
             "response.completed" => {
                 self.completed = true;
             }
             _ => {}
         }
+    }
+
+    fn image_seen(&mut self, item_id: &str, b64: &str) -> bool {
+        let mut h = Sha256::new();
+        h.update(b64.as_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        if let Some(prev) = self.seen_images.get(item_id) {
+            if *prev == digest {
+                return true;
+            }
+        }
+        self.seen_images.insert(item_id.to_string(), digest);
+        false
     }
 
     fn cur_index(&self) -> Option<usize> {
@@ -197,6 +276,11 @@ impl Aggregator {
                 .collect();
             Value::Array(arr)
         };
+        let images = if self.images.is_empty() {
+            Value::Null
+        } else {
+            Value::Array(self.images)
+        };
 
         let mut out = json!({
             "id": self.response_id,
@@ -210,6 +294,7 @@ impl Aggregator {
                     "content": content,
                     "reasoning_content": reasoning_content,
                     "tool_calls": tool_calls,
+                    "images": images,
                 },
                 "finish_reason": finish_reason,
                 "native_finish_reason": finish_reason,

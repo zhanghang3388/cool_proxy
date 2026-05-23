@@ -176,18 +176,82 @@ pub fn translate_request(model: &str, openai_body: &[u8], stream: bool) -> Value
                         Some(Value::Array(items)) => {
                             for it in items {
                                 let t = it.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                                if t == "text" {
-                                    let text = it
-                                        .get("text")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let mut part = Map::new();
-                                    part.insert("type".into(), Value::String(part_type.into()));
-                                    part.insert("text".into(), Value::String(text));
-                                    content_arr.push(Value::Object(part));
+                                match t {
+                                    "text" => {
+                                        let text = it
+                                            .get("text")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let mut part = Map::new();
+                                        part.insert("type".into(), Value::String(part_type.into()));
+                                        part.insert("text".into(), Value::String(text));
+                                        content_arr.push(Value::Object(part));
+                                    }
+                                    "image_url" if role == "user" => {
+                                        // OpenAI: {type:image_url, image_url:{url, detail?}} → codex input_image
+                                        let url = it
+                                            .get("image_url")
+                                            .and_then(|i| i.get("url"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if url.is_empty() {
+                                            continue;
+                                        }
+                                        let mut part = Map::new();
+                                        part.insert(
+                                            "type".into(),
+                                            Value::String("input_image".into()),
+                                        );
+                                        part.insert("image_url".into(), Value::String(url));
+                                        if let Some(detail) = it
+                                            .get("image_url")
+                                            .and_then(|i| i.get("detail"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            if !detail.is_empty() {
+                                                part.insert(
+                                                    "detail".into(),
+                                                    Value::String(detail.to_string()),
+                                                );
+                                            }
+                                        }
+                                        content_arr.push(Value::Object(part));
+                                    }
+                                    "file" if role == "user" => {
+                                        let file_data = it
+                                            .get("file")
+                                            .and_then(|f| f.get("file_data"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        if file_data.is_empty() {
+                                            continue;
+                                        }
+                                        let filename = it
+                                            .get("file")
+                                            .and_then(|f| f.get("filename"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let mut part = Map::new();
+                                        part.insert(
+                                            "type".into(),
+                                            Value::String("input_file".into()),
+                                        );
+                                        part.insert(
+                                            "file_data".into(),
+                                            Value::String(file_data.to_string()),
+                                        );
+                                        if !filename.is_empty() {
+                                            part.insert(
+                                                "filename".into(),
+                                                Value::String(filename.to_string()),
+                                            );
+                                        }
+                                        content_arr.push(Value::Object(part));
+                                    }
+                                    _ => {}
                                 }
-                                // image_url / file 不在本期支持范围内，跳过
                             }
                         }
                         _ => {}
@@ -241,6 +305,66 @@ pub fn translate_request(model: &str, openai_body: &[u8], stream: bool) -> Value
         }
     }
     out.insert("input".into(), Value::Array(input));
+
+    // response_format → text.format / text.verbosity（codex 用 text.format 承载结构化输出约束）
+    if let Some(rf) = raw.get("response_format") {
+        let mut text_obj = out
+            .get("text")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut format_obj: Map<String, Value> = Map::new();
+        match rf.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "text" => {
+                format_obj.insert("type".into(), Value::String("text".into()));
+            }
+            "json_object" => {
+                // OpenAI 老式 JSON mode；codex 没有这个枚举值，最近形态就是 json_schema 不带 schema
+                format_obj.insert("type".into(), Value::String("json_object".into()));
+            }
+            "json_schema" => {
+                if let Some(js) = rf.get("json_schema") {
+                    format_obj.insert("type".into(), Value::String("json_schema".into()));
+                    if let Some(name) = js.get("name") {
+                        format_obj.insert("name".into(), name.clone());
+                    }
+                    if let Some(strict) = js.get("strict") {
+                        format_obj.insert("strict".into(), strict.clone());
+                    }
+                    if let Some(schema) = js.get("schema") {
+                        format_obj.insert("schema".into(), schema.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !format_obj.is_empty() {
+            text_obj.insert("format".into(), Value::Object(format_obj));
+        }
+        if let Some(verbosity) = raw
+            .get("text")
+            .and_then(|t| t.get("verbosity"))
+            .filter(|v| !v.is_null())
+        {
+            text_obj.insert("verbosity".into(), verbosity.clone());
+        }
+        if !text_obj.is_empty() {
+            out.insert("text".into(), Value::Object(text_obj));
+        }
+    } else if let Some(verbosity) = raw
+        .get("text")
+        .and_then(|t| t.get("verbosity"))
+        .filter(|v| !v.is_null())
+    {
+        // 没传 response_format 但单独给了 text.verbosity 也尊重一下
+        let mut text_obj = out
+            .get("text")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        text_obj.insert("verbosity".into(), verbosity.clone());
+        out.insert("text".into(), Value::Object(text_obj));
+    }
 
     Value::Object(out)
 }

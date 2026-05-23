@@ -1,0 +1,29 @@
+{
+  "model": "gpt-5",
+  "instructions": "",
+  "stream": true,
+  "include": ["reasoning.encrypted_content"],
+  "parallel_tool_calls": true,
+  "store": false,
+  "reasoning": {"effort": "medium", "summary": "auto"},
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "give me a user object"}]
+    }
+  ],
+  "text": {
+    "verbosity": "low",
+    "format": {
+      "type": "json_schema",
+      "name": "user",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+        "required": ["name", "age"]
+      }
+    }
+  }
+}

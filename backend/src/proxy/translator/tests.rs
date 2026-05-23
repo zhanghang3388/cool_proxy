@@ -68,6 +68,32 @@ fn req_reasoning_effort_defaults_to_medium() {
     assert_eq!(got["store"], false);
 }
 
+#[test]
+fn req_multimodal_image_url_and_file_pass_through() {
+    let in_body = include_str!("./fixtures/req_multimodal.in.json").as_bytes();
+    let expected = parse(include_str!("./fixtures/req_multimodal.expected.json"));
+    let got = translate_request("gpt-5", in_body, true);
+    assert_eq!(
+        got,
+        expected,
+        "got = {}",
+        serde_json::to_string_pretty(&got).unwrap()
+    );
+}
+
+#[test]
+fn req_response_format_json_schema_maps_to_text_format() {
+    let in_body = include_str!("./fixtures/req_response_format.in.json").as_bytes();
+    let expected = parse(include_str!("./fixtures/req_response_format.expected.json"));
+    let got = translate_request("gpt-5", in_body, true);
+    assert_eq!(
+        got,
+        expected,
+        "got = {}",
+        serde_json::to_string_pretty(&got).unwrap()
+    );
+}
+
 fn run_stream_translator(events: &str, original_request: &[u8]) -> Vec<Value> {
     let mut tr = StreamTranslator::new("gpt-5-codex", original_request);
     let mut chunks: Vec<Value> = Vec::new();
@@ -169,4 +195,52 @@ fn aggregate_tool_call_stream_into_chat_completion() {
     assert_eq!(tool_calls[0]["function"]["arguments"], "{\"expr\":\"2+2\"}");
     // tool-only 响应：content 应为 null
     assert!(out["choices"][0]["message"]["content"].is_null());
+}
+
+#[test]
+fn stream_image_generation_dedup_and_emits_data_url() {
+    let events = include_str!("./fixtures/resp_image_stream.events.jsonl");
+    let chunks = run_stream_translator(events, b"{}");
+    // 期望：一条 text delta + 第一条 image partial + 第三条 image partial（第二条与第一条重复被吃掉）
+    // + finish_reason=stop。重复的不输出，所以总共 4 条。
+    assert_eq!(chunks.len(), 4, "got {} chunks: {:?}", chunks.len(), chunks);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "sure");
+    let img1 = &chunks[1]["choices"][0]["delta"]["images"][0];
+    assert_eq!(img1["type"], "image_url");
+    assert_eq!(
+        img1["image_url"]["url"].as_str().unwrap(),
+        "data:image/png;base64,AAAA"
+    );
+    let img2 = &chunks[2]["choices"][0]["delta"]["images"][0];
+    assert_eq!(
+        img2["image_url"]["url"].as_str().unwrap(),
+        "data:image/png;base64,BBBB"
+    );
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "stop");
+}
+
+#[test]
+fn aggregate_image_generation_collects_unique_images() {
+    let events = include_str!("./fixtures/resp_image_stream.events.jsonl");
+    let mut agg = Aggregator::new("gpt-5", b"{}");
+    for line in events.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let ev: Value = serde_json::from_str(line).unwrap();
+        agg.push(&ev);
+    }
+    let out = agg.finalize();
+    let imgs = &out["choices"][0]["message"]["images"];
+    assert!(imgs.is_array(), "got {imgs:?}");
+    let arr = imgs.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(
+        arr[0]["image_url"]["url"].as_str().unwrap(),
+        "data:image/png;base64,AAAA"
+    );
+    assert_eq!(
+        arr[1]["image_url"]["url"].as_str().unwrap(),
+        "data:image/png;base64,BBBB"
+    );
 }

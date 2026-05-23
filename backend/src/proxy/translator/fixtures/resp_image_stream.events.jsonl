@@ -1,0 +1,6 @@
+{"type":"response.created","response":{"id":"resp_img","created_at":1700000000,"model":"gpt-5"}}
+{"type":"response.output_text.delta","delta":"sure"}
+{"type":"response.image_generation_call.partial_image","item_id":"img_1","output_format":"png","partial_image_b64":"AAAA"}
+{"type":"response.image_generation_call.partial_image","item_id":"img_1","output_format":"png","partial_image_b64":"AAAA"}
+{"type":"response.image_generation_call.partial_image","item_id":"img_1","output_format":"png","partial_image_b64":"BBBB"}
+{"type":"response.completed","response":{"id":"resp_img","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}

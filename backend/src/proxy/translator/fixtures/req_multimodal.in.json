@@ -1,0 +1,19 @@
+{
+  "model": "gpt-5",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "describe this picture"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,XYZ", "detail": "high"}}
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "file", "file": {"file_data": "base64FILEDATA", "filename": "doc.pdf"}}
+      ]
+    }
+  ],
+  "stream": true
+}

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::tool_names::build_reverse_map_from_openai;
 
@@ -16,6 +17,8 @@ pub struct StreamTranslator {
     short_name_to_orig: HashMap<String, String>,
     /// 累积的 usage（codex 在多个事件里都可能带 response.usage，我们以最后一次为准）
     last_usage: Option<Value>,
+    /// 已经发送过的 image (item_id, sha256(b64))，用来去重 partial_image 重复
+    seen_images: HashMap<String, [u8; 32]>,
 }
 
 impl StreamTranslator {
@@ -28,6 +31,7 @@ impl StreamTranslator {
             has_received_args_delta: false,
             short_name_to_orig: build_reverse_map_from_openai(original_openai_body),
             last_usage: None,
+            seen_images: HashMap::new(),
         }
     }
 
@@ -191,6 +195,81 @@ impl StreamTranslator {
                 });
                 vec![chunk]
             }
+            "response.image_generation_call.partial_image" => {
+                let item_id = codex_event
+                    .get("item_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let b64 = codex_event
+                    .get("partial_image_b64")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if b64.is_empty() {
+                    return Vec::new();
+                }
+                if !item_id.is_empty() && self.seen(&item_id, b64) {
+                    return Vec::new();
+                }
+                let mime = mime_from_codex_format(
+                    codex_event
+                        .get("output_format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                let url = format!("data:{mime};base64,{b64}");
+                let mut chunk = self.empty_chunk();
+                chunk["choices"][0]["delta"] = json!({
+                    "role": "assistant",
+                    "images": [{
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                        "index": 0,
+                    }],
+                });
+                vec![chunk]
+            }
+            "response.output_item.done" => {
+                let item = codex_event.get("item");
+                let item_type = item
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if item_type != "image_generation_call" {
+                    return Vec::new();
+                }
+                let item_id = item
+                    .and_then(|i| i.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let b64 = item
+                    .and_then(|i| i.get("result"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if b64.is_empty() {
+                    return Vec::new();
+                }
+                if !item_id.is_empty() && self.seen(&item_id, b64) {
+                    return Vec::new();
+                }
+                let mime = mime_from_codex_format(
+                    item.and_then(|i| i.get("output_format"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                let url = format!("data:{mime};base64,{b64}");
+                let mut chunk = self.empty_chunk();
+                chunk["choices"][0]["delta"] = json!({
+                    "role": "assistant",
+                    "images": [{
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                        "index": 0,
+                    }],
+                });
+                vec![chunk]
+            }
             "response.completed" => {
                 let finish = if self.function_call_index != -1 {
                     "tool_calls"
@@ -223,6 +302,37 @@ impl StreamTranslator {
                 "native_finish_reason": null,
             }]
         })
+    }
+
+    /// 同一 item_id 的同一 b64 重复出现时返回 true（调用方应跳过该事件）。
+    fn seen(&mut self, item_id: &str, b64: &str) -> bool {
+        let mut h = Sha256::new();
+        h.update(b64.as_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        if let Some(prev) = self.seen_images.get(item_id) {
+            if *prev == digest {
+                return true;
+            }
+        }
+        self.seen_images.insert(item_id.to_string(), digest);
+        false
+    }
+}
+
+/// codex `output_format` → mime。空值默认 png；含 `/` 视为已经是 mime。
+pub fn mime_from_codex_format(fmt: &str) -> String {
+    if fmt.is_empty() {
+        return "image/png".into();
+    }
+    if fmt.contains('/') {
+        return fmt.to_string();
+    }
+    match fmt.to_ascii_lowercase().as_str() {
+        "png" => "image/png".into(),
+        "jpg" | "jpeg" => "image/jpeg".into(),
+        "webp" => "image/webp".into(),
+        "gif" => "image/gif".into(),
+        _ => "image/png".into(),
     }
 }
 
