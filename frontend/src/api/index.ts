@@ -1,5 +1,15 @@
 import axios, { AxiosInstance } from 'axios'
 
+export interface ModelStateView {
+  model_key: string
+  next_retry_after: string | null
+  last_status: number | null
+  last_error: string | null
+  last_kind: string | null
+  transient_fails: number
+  quota_backoff_lv: number
+}
+
 export interface AccountView {
   id: string
   email: string
@@ -17,6 +27,7 @@ export interface AccountView {
   expired: boolean
   proxy_url: string
   proxy_id: string | null
+  model_states: ModelStateView[]
 }
 
 export interface AccountListResp {
@@ -93,6 +104,7 @@ export interface StatsView {
   total_accounts: number
   enabled_accounts: number
   cooling_down: number
+  model_cooling_down: number
   expired: number
   total_requests: number
   total_failures: number

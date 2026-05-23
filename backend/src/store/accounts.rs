@@ -284,12 +284,144 @@ pub fn set_proxy(pool: &SqlitePool, id: &str, proxy_url: &str) -> Result<bool> {
 }
 
 pub fn reset_cooldown(pool: &SqlitePool, id: &str) -> Result<bool> {
-    let conn = pool.get()?;
-    let n = conn.execute(
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+    let n = tx.execute(
         "UPDATE accounts SET failure_count = 0, cooldown_until = NULL, last_error = NULL WHERE id = ?1",
         params![id],
     )?;
+    tx.execute(
+        "DELETE FROM account_model_states WHERE account_id = ?1",
+        params![id],
+    )?;
+    tx.commit()?;
     Ok(n > 0)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelStateRow {
+    pub model_key: String,
+    pub next_retry_after: Option<DateTime<Utc>>,
+    pub quota_backoff_lv: i64,
+    pub transient_fails: i64,
+    pub last_status: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_kind: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+fn row_to_model_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelStateRow> {
+    Ok(ModelStateRow {
+        model_key: r.get("model_key")?,
+        next_retry_after: ms_to_dt(r.get("next_retry_after")?),
+        quota_backoff_lv: r.get("quota_backoff_lv")?,
+        transient_fails: r.get("transient_fails")?,
+        last_status: r.get("last_status")?,
+        last_error: r.get("last_error")?,
+        last_kind: r.get("last_kind")?,
+        updated_at: ms_to_dt(r.get("updated_at")?),
+    })
+}
+
+pub fn get_model_state(
+    pool: &SqlitePool,
+    account_id: &str,
+    model_key: &str,
+) -> Result<Option<ModelStateRow>> {
+    let conn = pool.get()?;
+    Ok(conn
+        .query_row(
+            "SELECT * FROM account_model_states WHERE account_id = ?1 AND model_key = ?2",
+            params![account_id, model_key],
+            row_to_model_state,
+        )
+        .optional()?)
+}
+
+pub fn list_model_states(pool: &SqlitePool, account_id: &str) -> Result<Vec<ModelStateRow>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT * FROM account_model_states WHERE account_id = ?1 ORDER BY model_key",
+    )?;
+    let it = stmt.query_map(params![account_id], row_to_model_state)?;
+    Ok(it.filter_map(|r| r.ok()).collect())
+}
+
+/// 候选过滤用：返回所有"当前还在冷却"的 (account_id, model_key) 对。
+/// 调用方在 pick_for 阶段把对应账号过滤掉。返回的 model_key 含空串，表示账号级冷却。
+pub fn currently_cooling(pool: &SqlitePool, now_ms: i64) -> Result<Vec<(String, String)>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT account_id, model_key FROM account_model_states
+         WHERE next_retry_after IS NOT NULL AND next_retry_after > ?1",
+    )?;
+    let it = stmt.query_map(params![now_ms], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    Ok(it.filter_map(|r| r.ok()).collect())
+}
+
+/// distinct 账号数：当前至少有一个 model_state 还在冷却的账号。
+pub fn cooling_account_count(pool: &SqlitePool, now_ms: i64) -> Result<i64> {
+    let conn = pool.get()?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT account_id) FROM account_model_states
+         WHERE next_retry_after IS NOT NULL AND next_retry_after > ?1",
+        params![now_ms],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_model_state(
+    pool: &SqlitePool,
+    account_id: &str,
+    model_key: &str,
+    next_retry_after_ms: Option<i64>,
+    quota_backoff_lv: i64,
+    transient_fails: i64,
+    last_status: Option<i64>,
+    last_error: Option<&str>,
+    last_kind: Option<&str>,
+) -> Result<()> {
+    let conn = pool.get()?;
+    let now = Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO account_model_states(
+            account_id, model_key, next_retry_after, quota_backoff_lv, transient_fails,
+            last_status, last_error, last_kind, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(account_id, model_key) DO UPDATE SET
+            next_retry_after = excluded.next_retry_after,
+            quota_backoff_lv = excluded.quota_backoff_lv,
+            transient_fails  = excluded.transient_fails,
+            last_status      = excluded.last_status,
+            last_error       = excluded.last_error,
+            last_kind        = excluded.last_kind,
+            updated_at       = excluded.updated_at",
+        params![
+            account_id,
+            model_key,
+            next_retry_after_ms,
+            quota_backoff_lv,
+            transient_fails,
+            last_status,
+            last_error,
+            last_kind,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn clear_model_state(pool: &SqlitePool, account_id: &str, model_key: &str) -> Result<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "DELETE FROM account_model_states WHERE account_id = ?1 AND model_key = ?2",
+        params![account_id, model_key],
+    )?;
+    Ok(())
 }
 
 /// pick 用：原子 update 一行的 last_used_at + total_requests，并取出选中的 access/account/proxy。
@@ -312,6 +444,7 @@ pub fn report_success(pool: &SqlitePool, id: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn report_failure(
     pool: &SqlitePool,
     id: &str,

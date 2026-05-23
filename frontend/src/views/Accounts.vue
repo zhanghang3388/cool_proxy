@@ -85,7 +85,7 @@ const columns = computed<DataTableColumns<AccountView>>(() => [
   {
     title: '状态',
     key: 'status',
-    width: 140,
+    width: 180,
     render: (row) => {
       const tags: ReturnType<typeof h>[] = []
       if (!row.enabled) {
@@ -96,6 +96,22 @@ const columns = computed<DataTableColumns<AccountView>>(() => [
         tags.push(h(NTag, { type: 'error', size: 'small' }, { default: () => '已过期' }))
       } else {
         tags.push(h(NTag, { type: 'success', size: 'small' }, { default: () => '可用' }))
+      }
+      const now = Date.now()
+      const cooling = (row.model_states ?? []).filter(
+        (s) => s.next_retry_after && new Date(s.next_retry_after).getTime() > now,
+      )
+      if (cooling.length > 0) {
+        const detail = cooling
+          .map((s) => `${s.model_key || '(全局)'} · ${s.last_kind ?? '?'} → ${fmtTime(s.next_retry_after)}`)
+          .join('\n')
+        tags.push(
+          h(
+            NTag,
+            { type: 'warning', size: 'small', title: detail },
+            { default: () => `+${cooling.length} model 冷却` },
+          ),
+        )
       }
       return h(NSpace, { size: 4 }, { default: () => tags })
     },
@@ -321,10 +337,11 @@ async function submitPaste() {
 
 <template>
   <n-space vertical :size="16">
-    <n-grid :cols="4" :x-gap="12" v-if="stats">
+    <n-grid :cols="5" :x-gap="12" v-if="stats">
       <n-gi><n-card><n-statistic label="账号总数" :value="stats.total_accounts" /></n-card></n-gi>
       <n-gi><n-card><n-statistic label="启用中" :value="stats.enabled_accounts" /></n-card></n-gi>
-      <n-gi><n-card><n-statistic label="冷却中" :value="stats.cooling_down" /></n-card></n-gi>
+      <n-gi><n-card><n-statistic label="账号冷却" :value="stats.cooling_down" /></n-card></n-gi>
+      <n-gi><n-card><n-statistic label="model 冷却" :value="stats.model_cooling_down" /></n-card></n-gi>
       <n-gi><n-card><n-statistic label="累计请求 / 失败" :value="`${stats.total_requests} / ${stats.total_failures}`" /></n-card></n-gi>
     </n-grid>
 

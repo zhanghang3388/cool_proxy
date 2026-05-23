@@ -41,6 +41,17 @@ fn sanitize_upload_filename(raw: Option<&str>) -> Option<String> {
 }
 
 #[derive(Serialize)]
+pub struct ModelStateView {
+    pub model_key: String,
+    pub next_retry_after: Option<String>,
+    pub last_status: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_kind: Option<String>,
+    pub transient_fails: i64,
+    pub quota_backoff_lv: i64,
+}
+
+#[derive(Serialize)]
 pub struct AccountView {
     pub id: String,
     pub email: String,
@@ -58,6 +69,7 @@ pub struct AccountView {
     pub expired: bool,
     pub proxy_url: String,
     pub proxy_id: Option<String>,
+    pub model_states: Vec<ModelStateView>,
 }
 
 #[derive(Serialize)]
@@ -102,23 +114,40 @@ pub async fn list(
 
     let items = rows
         .into_iter()
-        .map(|a| AccountView {
-            expired: a.expire_at.map(|t| t <= now).unwrap_or(true),
-            id: a.id,
-            email: a.email,
-            account_id: a.account_id,
-            plan: a.plan,
-            enabled: a.enabled,
-            expire_at: a.expire_at.map(|t| t.to_rfc3339()),
-            last_refresh_at: a.last_refresh_at.map(|t| t.to_rfc3339()),
-            last_used_at: a.last_used_at.map(|t| t.to_rfc3339()),
-            failure_count: a.failure_count,
-            cooldown_until: a.cooldown_until.map(|t| t.to_rfc3339()),
-            last_error: a.last_error,
-            total_requests: a.total_requests,
-            total_failures: a.total_failures,
-            proxy_id: app.proxy_pool.id_by_url(&a.proxy_url),
-            proxy_url: a.proxy_url,
+        .map(|a| {
+            let states: Vec<ModelStateView> = app
+                .pool
+                .list_model_states(&a.id)
+                .into_iter()
+                .map(|s| ModelStateView {
+                    model_key: s.model_key,
+                    next_retry_after: s.next_retry_after.map(|t| t.to_rfc3339()),
+                    last_status: s.last_status,
+                    last_error: s.last_error,
+                    last_kind: s.last_kind,
+                    transient_fails: s.transient_fails,
+                    quota_backoff_lv: s.quota_backoff_lv,
+                })
+                .collect();
+            AccountView {
+                expired: a.expire_at.map(|t| t <= now).unwrap_or(true),
+                id: a.id,
+                email: a.email,
+                account_id: a.account_id,
+                plan: a.plan,
+                enabled: a.enabled,
+                expire_at: a.expire_at.map(|t| t.to_rfc3339()),
+                last_refresh_at: a.last_refresh_at.map(|t| t.to_rfc3339()),
+                last_used_at: a.last_used_at.map(|t| t.to_rfc3339()),
+                failure_count: a.failure_count,
+                cooldown_until: a.cooldown_until.map(|t| t.to_rfc3339()),
+                last_error: a.last_error,
+                total_requests: a.total_requests,
+                total_failures: a.total_failures,
+                proxy_id: app.proxy_pool.id_by_url(&a.proxy_url),
+                proxy_url: a.proxy_url,
+                model_states: states,
+            }
         })
         .collect();
 

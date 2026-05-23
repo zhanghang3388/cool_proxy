@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -9,6 +10,7 @@ use tracing::{info, warn};
 
 use crate::auth::codex::{scan_codex_files, CodexTokenStorage};
 use crate::config::Config;
+use crate::proxy::{classify, quota_backoff, ErrorKind};
 use crate::store::accounts as store_accounts;
 use crate::store::accounts::AccountRow;
 use crate::store::SqlitePool;
@@ -33,6 +35,16 @@ pub struct SelectedAccount {
     pub access_token: String,
     pub account_id: String,
     pub proxy_url: String,
+}
+
+/// 错误分类化上报的入参。`status = None` 表示请求层失败（reqwest::Error）。
+#[derive(Debug, Clone)]
+pub struct ReportContext<'a> {
+    pub id: &'a str,
+    pub model: &'a str,
+    pub status: Option<u16>,
+    pub retry_after: Option<Duration>,
+    pub message: &'a str,
 }
 
 /// "DB 主 + 内存索引"模式：DB 是真相源，内存只缓存 ID 列表用于 round-robin。
@@ -118,27 +130,51 @@ impl AccountPool {
         store_accounts::get(&self.db, id).ok().flatten()
     }
 
-    /// 轮询挑一个可用账号。先从内存 ID 索引取候选，再按 ID 查 DB 行做可用性判断。
-    /// 内存只读锁极快；写状态时单条 UPDATE，几千个号也不会有锁竞争。
+    /// 兼容老调用方：等价于 `pick_for("")`。新代码请用 `pick_for(model)`。
+    #[allow(dead_code)]
     pub fn pick(&self) -> Result<SelectedAccount, PoolError> {
+        self.pick_for("")
+    }
+
+    /// `pick_for(model)`：在内存 round-robin 的基础上，过滤掉
+    ///   - 该 (account, model) 处在冷却的；
+    ///   - 该 account 的全局冷却（model_key="" 行）；
+    ///   - 老的 accounts.cooldown_until（兼容字段，仍然尊重）。
+    /// model 传 "" 等价于老 `pick`，仅看账号级状态。
+    pub fn pick_for(&self, model: &str) -> Result<SelectedAccount, PoolError> {
         let now = Utc::now();
+        let now_ms = now.timestamp_millis();
         let ids = self.ids.read().unwrap();
         if ids.is_empty() {
             return Err(PoolError::Empty);
         }
+
+        // 当前正在冷却的 (account_id, model_key)；用 set 做 O(1) 判定
+        let cooling = store_accounts::currently_cooling(&self.db, now_ms).unwrap_or_default();
+        let mut blocked_global: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut blocked_model: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (aid, mk) in cooling.iter() {
+            if mk.is_empty() {
+                blocked_global.insert(aid.as_str());
+            } else if mk == model && !model.is_empty() {
+                blocked_model.insert(aid.as_str());
+            }
+        }
+
         let n = ids.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
         for i in 0..n {
             let idx = (start + i) % n;
             let id = &ids[idx];
-            // 取一行做可用性检查（DB 是真相源）
+            if blocked_global.contains(id.as_str()) || blocked_model.contains(id.as_str()) {
+                continue;
+            }
             let Some(a) = store_accounts::get(&self.db, id).ok().flatten() else {
                 continue;
             };
             if !a.is_available(now) {
                 continue;
             }
-            // 标记 last_used / total_requests 自增
             let _ = store_accounts::mark_used(&self.db, id);
             return Ok(SelectedAccount {
                 id: a.id,
@@ -152,9 +188,26 @@ impl AccountPool {
 
     pub fn report_success(&self, id: &str) {
         let _ = store_accounts::report_success(&self.db, id);
+        // 也清掉 model 状态表里这个号的"全局冷却"行，避免老数据残留
+        let _ = store_accounts::clear_model_state(&self.db, id, "");
     }
 
+    /// 单个 (account, model) 维度的成功上报：清掉该 model 状态 + 全局 transient 行。
+    pub fn report_success_for(&self, id: &str, model: &str) {
+        let _ = store_accounts::report_success(&self.db, id);
+        let _ = store_accounts::clear_model_state(&self.db, id, "");
+        if !model.is_empty() {
+            let _ = store_accounts::clear_model_state(&self.db, id, model);
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn report_failure(&self, id: &str, status: u16, msg: &str) {
+        // 兼容旧调用路径（如果还有人调）。如果开了 disable_cooldown 就只记错误。
+        if self.cfg.retry.disable_cooldown {
+            let _ = store_accounts::mark_refresh_failed(&self.db, id, msg);
+            return;
+        }
         let line = format!("HTTP {status}: {msg}");
         let _ = store_accounts::report_failure(
             &self.db,
@@ -164,6 +217,155 @@ impl AccountPool {
             self.cfg.retry.long_cooldown_seconds as i64,
             self.cfg.retry.failure_threshold,
         );
+    }
+
+    /// 错误分类化上报。返回这次错误的分类，调用方根据 kind 决定要不要 spawn refresh / 是否继续重试。
+    pub fn report(&self, ctx: ReportContext<'_>) -> ErrorKind {
+        let kind = classify(ctx.status);
+        let now_ms = Utc::now().timestamp_millis();
+        let disable = self.cfg.retry.disable_cooldown;
+        let status_i = ctx.status.map(|c| c as i64);
+        let label = kind.label();
+        let model_for_state = match kind {
+            // 网络错误归账号级（model_key = ""），其他写到具体 model 上
+            ErrorKind::Network => "",
+            _ => ctx.model,
+        };
+
+        match kind {
+            ErrorKind::Auth => {
+                // 401/402/403：不写 next_retry_after。只记录最近错误，等 refresh_one 来兜底。
+                let _ = store_accounts::upsert_model_state(
+                    &self.db,
+                    ctx.id,
+                    model_for_state,
+                    None,
+                    0,
+                    0,
+                    status_i,
+                    Some(ctx.message),
+                    Some(label),
+                );
+            }
+            ErrorKind::NotFound => {
+                let next = if disable {
+                    None
+                } else {
+                    Some(now_ms + 12 * 60 * 60 * 1000)
+                };
+                let _ = store_accounts::upsert_model_state(
+                    &self.db,
+                    ctx.id,
+                    model_for_state,
+                    next,
+                    0,
+                    0,
+                    status_i,
+                    Some(ctx.message),
+                    Some(label),
+                );
+            }
+            ErrorKind::Quota => {
+                if disable {
+                    let _ = store_accounts::upsert_model_state(
+                        &self.db,
+                        ctx.id,
+                        model_for_state,
+                        None,
+                        0,
+                        0,
+                        status_i,
+                        Some(ctx.message),
+                        Some(label),
+                    );
+                } else {
+                    let prev_lv = store_accounts::get_model_state(&self.db, ctx.id, model_for_state)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.quota_backoff_lv)
+                        .unwrap_or(0);
+                    let (cooldown, next_lv) = match ctx.retry_after {
+                        Some(d) if !d.is_zero() => (d, prev_lv),
+                        _ => quota_backoff(prev_lv),
+                    };
+                    let next = now_ms + cooldown.as_millis() as i64;
+                    let _ = store_accounts::upsert_model_state(
+                        &self.db,
+                        ctx.id,
+                        model_for_state,
+                        Some(next),
+                        next_lv,
+                        0,
+                        status_i,
+                        Some(ctx.message),
+                        Some(label),
+                    );
+                }
+            }
+            ErrorKind::Transient | ErrorKind::Network => {
+                // 累加 transient_fails；满阈值才写 next_retry_after
+                let prev = store_accounts::get_model_state(&self.db, ctx.id, model_for_state)
+                    .ok()
+                    .flatten();
+                let new_fails = prev.as_ref().map(|s| s.transient_fails).unwrap_or(0) + 1;
+                let threshold = self.cfg.retry.transient_threshold.max(1) as i64;
+                let next = if !disable && new_fails >= threshold {
+                    Some(now_ms + (self.cfg.retry.cooldown_seconds as i64) * 1000)
+                } else {
+                    prev.and_then(|s| s.next_retry_after)
+                        .map(|t| t.timestamp_millis())
+                };
+                let _ = store_accounts::upsert_model_state(
+                    &self.db,
+                    ctx.id,
+                    model_for_state,
+                    next,
+                    0,
+                    new_fails,
+                    status_i,
+                    Some(ctx.message),
+                    Some(label),
+                );
+            }
+            ErrorKind::Client => {
+                // 客户端错误：不冷却、不计失败，仅记最近错误
+                let _ = store_accounts::upsert_model_state(
+                    &self.db,
+                    ctx.id,
+                    model_for_state,
+                    None,
+                    0,
+                    0,
+                    status_i,
+                    Some(ctx.message),
+                    Some(label),
+                );
+            }
+        }
+        kind
+    }
+
+    /// refresh 失败后的兜底：把账号级 (model_key="") 行写一个 30min 冷却，
+    /// 避免后续每次请求都触发重复 refresh 风暴。
+    pub fn mark_auth_dead(&self, id: &str, msg: &str) {
+        if self.cfg.retry.disable_cooldown {
+            let _ = store_accounts::mark_refresh_failed(&self.db, id, msg);
+            return;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        let next = now_ms + 30 * 60 * 1000;
+        let _ = store_accounts::upsert_model_state(
+            &self.db,
+            id,
+            "",
+            Some(next),
+            0,
+            0,
+            Some(401),
+            Some(msg),
+            Some("auth_dead"),
+        );
+        let _ = store_accounts::mark_refresh_failed(&self.db, id, msg);
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> bool {
@@ -231,6 +433,15 @@ impl AccountPool {
 
     pub fn reset_cooldown(&self, id: &str) -> bool {
         store_accounts::reset_cooldown(&self.db, id).unwrap_or(false)
+    }
+
+    pub fn list_model_states(&self, id: &str) -> Vec<store_accounts::ModelStateRow> {
+        store_accounts::list_model_states(&self.db, id).unwrap_or_default()
+    }
+
+    pub fn cooling_account_count(&self) -> i64 {
+        let now_ms = Utc::now().timestamp_millis();
+        store_accounts::cooling_account_count(&self.db, now_ms).unwrap_or(0)
     }
 
     pub fn stats_overview(&self) -> anyhow::Result<StatsCounts> {

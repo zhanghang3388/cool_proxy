@@ -28,6 +28,16 @@ pub struct RetryConfig {
     pub cooldown_seconds: u64,
     pub long_cooldown_seconds: u64,
     pub failure_threshold: u32,
+    /// 连续 N 次 transient/网络失败后才进短冷却。默认 3。
+    #[serde(default = "default_transient_threshold")]
+    pub transient_threshold: u32,
+    /// 紧急逃生开关：true 时所有冷却写入都跳过，号永远可用，方便定位上游真实错误。
+    #[serde(default)]
+    pub disable_cooldown: bool,
+}
+
+fn default_transient_threshold() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

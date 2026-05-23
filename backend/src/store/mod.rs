@@ -77,6 +77,21 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
             created_at  INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS account_model_states (
+            account_id        TEXT NOT NULL,
+            model_key         TEXT NOT NULL,
+            next_retry_after  INTEGER,
+            quota_backoff_lv  INTEGER NOT NULL DEFAULT 0,
+            transient_fails   INTEGER NOT NULL DEFAULT 0,
+            last_status       INTEGER,
+            last_error        TEXT,
+            last_kind         TEXT,
+            updated_at        INTEGER NOT NULL,
+            PRIMARY KEY(account_id, model_key),
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_ams_next_retry ON account_model_states(next_retry_after);
+
         CREATE TABLE IF NOT EXISTS kv (
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL

@@ -10,12 +10,14 @@ use futures_util::StreamExt;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::pool::PoolError;
+use crate::pool::{PoolError, ReportContext};
 use crate::state::AppState;
 
 pub mod clients;
+pub mod error_class;
 pub mod log;
 pub use clients::ProxiedClients;
+pub use error_class::{classify, quota_backoff, ErrorKind};
 pub use log::{LogEntry, RequestLog};
 
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9";
@@ -123,7 +125,7 @@ pub async fn proxy_handler(
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
 
     for attempt in 0..max_attempts {
-        let selected = match app.pool.pick() {
+        let selected = match app.pool.pick_for(model.as_deref().unwrap_or("")) {
             Ok(s) => s,
             Err(PoolError::Empty) => {
                 app.request_log.push(
@@ -195,11 +197,11 @@ pub async fn proxy_handler(
         .await;
 
         match res {
-            Ok(mut resp) => {
+            Ok((mut resp, retry_after)) => {
                 let status = resp.status();
                 if status.is_success() || status == StatusCode::NOT_MODIFIED {
-                    app.pool.report_success(&selected.id);
-                    // 把响应体包一层 tee：边转发边累积尾部 32KB，stream 完了解析 usage 写库
+                    let model_for_state = model.clone().unwrap_or_default();
+                    app.pool.report_success_for(&selected.id, &model_for_state);
                     let original_body = std::mem::replace(resp.body_mut(), Body::empty());
                     let log = app.request_log.clone();
                     let method = parts.method.clone();
@@ -228,45 +230,81 @@ pub async fn proxy_handler(
                     *resp.body_mut() = teed;
                     return resp;
                 }
-                if should_retry(status) {
-                    // 失败响应不会再返给下游，先吃掉前几百字节作为 last_error，便于面板排查
-                    let body = std::mem::replace(resp.body_mut(), Body::empty());
-                    let snippet = match axum::body::to_bytes(body, 4 * 1024).await {
-                        Ok(b) if !b.is_empty() => {
-                            let s = String::from_utf8_lossy(&b).into_owned();
-                            truncate_snippet(&s, 300)
-                        }
-                        _ => format!("upstream {status}"),
-                    };
-                    warn!(
-                        account = %selected.id,
-                        status = %status,
-                        "request failed, will retry with another account"
-                    );
-                    app.pool.report_failure(&selected.id, status.as_u16(), &snippet);
-                    last_error = Some((status, format!("upstream {status}: {snippet}")));
-                    continue;
+
+                // 失败响应：先吃掉前几百字节做 last_error，再分类处理
+                let body = std::mem::replace(resp.body_mut(), Body::empty());
+                let snippet = match axum::body::to_bytes(body, 4 * 1024).await {
+                    Ok(b) if !b.is_empty() => {
+                        let s = String::from_utf8_lossy(&b).into_owned();
+                        truncate_snippet(&s, 300)
+                    }
+                    _ => format!("upstream {status}"),
+                };
+                let model_str = model.clone().unwrap_or_default();
+                let kind = app.pool.report(ReportContext {
+                    id: &selected.id,
+                    model: &model_str,
+                    status: Some(status.as_u16()),
+                    retry_after,
+                    message: &snippet,
+                });
+
+                match kind {
+                    crate::proxy::ErrorKind::Auth => {
+                        // access_token 失效：后台异步 refresh，本次换号继续
+                        spawn_refresh(app.clone(), selected.id.clone());
+                        warn!(
+                            account = %selected.id,
+                            status = %status,
+                            "auth error, refresh spawned, switching account"
+                        );
+                        last_error = Some((status, format!("upstream {status}: {snippet}")));
+                        continue;
+                    }
+                    crate::proxy::ErrorKind::Client => {
+                        // 客户端错误：直接返给调用方
+                        app.request_log.push(
+                            &parts.method,
+                            &upstream_path,
+                            Some(selected.id.clone()),
+                            model.clone(),
+                            status.as_u16(),
+                            started.elapsed().as_millis() as u64,
+                            attempt + 1,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        // resp.body 已经被消耗，重新组一个携带 snippet 的响应
+                        return (status, snippet).into_response();
+                    }
+                    crate::proxy::ErrorKind::Quota
+                    | crate::proxy::ErrorKind::NotFound
+                    | crate::proxy::ErrorKind::Transient
+                    | crate::proxy::ErrorKind::Network => {
+                        warn!(
+                            account = %selected.id,
+                            status = %status,
+                            kind = kind.label(),
+                            "upstream error, will retry with another account"
+                        );
+                        last_error = Some((status, format!("upstream {status}: {snippet}")));
+                        continue;
+                    }
                 }
-                // 4xx 客户端错误（不是账号问题）直接返给调用方
-                app.request_log.push(
-                    &parts.method,
-                    &upstream_path,
-                    Some(selected.id.clone()),
-                    model.clone(),
-                    status.as_u16(),
-                    started.elapsed().as_millis() as u64,
-                    attempt + 1,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-                return resp;
             }
             Err(e) => {
                 error!(account = %selected.id, "forward error: {e:?}");
-                app.pool
-                    .report_failure(&selected.id, 0, &format!("network: {e}"));
+                let model_str = model.clone().unwrap_or_default();
+                let msg = format!("network: {e}");
+                app.pool.report(ReportContext {
+                    id: &selected.id,
+                    model: &model_str,
+                    status: None,
+                    retry_after: None,
+                    message: &msg,
+                });
                 last_error = Some((
                     StatusCode::BAD_GATEWAY,
                     format!("upstream network error: {e}"),
@@ -303,11 +341,37 @@ fn extract_upstream_path(uri: &Uri) -> Option<String> {
     Some(pq.as_str().to_string())
 }
 
-fn should_retry(status: StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        401 | 403 | 408 | 425 | 429 | 500 | 502 | 503 | 504
-    )
+/// 解析上游响应里的 Retry-After 头。支持秒数和 HTTP-date 两种形式（这里只识别秒数）。
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let v = headers.get("retry-after")?;
+    let s = v.to_str().ok()?.trim();
+    s.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// 401/auth 类失败：后台异步刷一次 token；失败则在账号上写 30min 冷却避免风暴。
+fn spawn_refresh(app: Arc<AppState>, id: String) {
+    tokio::spawn(async move {
+        let Some(acc) = app.pool.get(&id) else {
+            return;
+        };
+        if acc.refresh_token.is_empty() {
+            app.pool.mark_auth_dead(&id, "no refresh_token on file");
+            return;
+        }
+        let storage = acc.to_storage();
+        match app.refresher.refresh(&storage, &acc.proxy_url).await {
+            Ok(new_storage) => {
+                app.pool.update_after_refresh(&id, &new_storage);
+                app.pool.report_success(&id);
+                info!(account = %id, "token refreshed (auth-triggered)");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(account = %id, "auth-triggered refresh failed: {msg}");
+                app.pool.mark_auth_dead(&id, &msg);
+            }
+        }
+    });
 }
 
 /// 把上游错误体做成可读的简短 snippet，去掉换行、限制长度，避免日志/UI 里塞进 KB 级内容。
@@ -432,7 +496,7 @@ async fn forward_once(
     access_token: &str,
     account_id: &str,
     proxy_url: &str,
-) -> anyhow::Result<Response> {
+) -> anyhow::Result<(Response, Option<Duration>)> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), upstream_path);
     let http = clients.get(proxy_url)?;
 
@@ -478,6 +542,7 @@ async fn forward_once(
 
     let upstream = req.send().await?;
     let status = upstream.status();
+    let retry_after = parse_retry_after(upstream.headers());
     let mut headers = HeaderMap::new();
     for (k, v) in upstream.headers().iter() {
         let name_lower = k.as_str().to_ascii_lowercase();
@@ -502,5 +567,5 @@ async fn forward_once(
         .body(body)
         .map_err(|e| anyhow::anyhow!("build response: {e}"))?;
     *resp.headers_mut() = headers;
-    Ok(resp)
+    Ok((resp, retry_after))
 }

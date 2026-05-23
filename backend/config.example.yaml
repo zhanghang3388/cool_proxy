@@ -19,9 +19,11 @@ upstream:
 # 失败处理
 retry:
   max_retries: 3
-  cooldown_seconds: 60          # 单次失败冷却
-  long_cooldown_seconds: 300    # 连续失败长冷却
-  failure_threshold: 3          # 连续失败几次进入长冷却
+  cooldown_seconds: 60          # transient/网络错误连续超阈值后的短冷却
+  long_cooldown_seconds: 300    # 兼容字段，按 (账号, 模型) 二维状态机后已不再使用
+  failure_threshold: 3          # 兼容字段，按 (账号, 模型) 二维状态机后已不再使用
+  transient_threshold: 3        # 连续 N 次 5xx/网络错才进短冷却；默认 3
+  disable_cooldown: false       # true = 所有冷却写入跳过，便于定位上游真实错误
 
 # token 刷新
 token_refresh:
