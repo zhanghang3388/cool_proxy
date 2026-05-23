@@ -101,6 +101,18 @@ pub async fn proxy_handler(
         }
     };
 
+    // /v1/models 是 OpenAI 兼容的"列出模型"接口。codex 上游没有这个端点，
+    // 这里直接返回项目支持的几个 model id，方便 SDK 拉一次列表能起来。
+    if req.method() == Method::GET {
+        let path_only = req.uri().path();
+        if path_only == "/v1/models" {
+            return models_list_response();
+        }
+        if let Some(id) = path_only.strip_prefix("/v1/models/") {
+            return models_get_response(id);
+        }
+    }
+
     // 读取请求体（一次性）。Codex 请求体一般不大，简单实现先这样。
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
@@ -341,6 +353,50 @@ fn extract_upstream_path(uri: &Uri) -> Option<String> {
     Some(pq.as_str().to_string())
 }
 
+/// 项目支持的 model 列表。新增上游模型时在这里加一行；按 codex 客户端实测的字符串原样填。
+const SUPPORTED_MODELS: &[&str] = &[
+    "gpt-5-codex",
+    "gpt-5-codex-mini",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-4.1",
+];
+
+fn build_model_obj(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "model",
+        // 固定时间戳：codex 不暴露 created，给个稳定值让 SDK 别奇怪
+        "created": 1_700_000_000u64,
+        "owned_by": "openai",
+    })
+}
+
+fn models_list_response() -> Response {
+    let data: Vec<serde_json::Value> =
+        SUPPORTED_MODELS.iter().map(|m| build_model_obj(m)).collect();
+    let body = serde_json::json!({
+        "object": "list",
+        "data": data,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+fn models_get_response(id: &str) -> Response {
+    if SUPPORTED_MODELS.contains(&id) {
+        (StatusCode::OK, axum::Json(build_model_obj(id))).into_response()
+    } else {
+        let body = serde_json::json!({
+            "error": {
+                "message": format!("model '{id}' not found"),
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        });
+        (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+    }
+}
+
 /// 解析上游响应里的 Retry-After 头。支持秒数和 HTTP-date 两种形式（这里只识别秒数）。
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let v = headers.get("retry-after")?;
@@ -355,7 +411,14 @@ fn spawn_refresh(app: Arc<AppState>, id: String) {
             return;
         };
         if acc.refresh_token.is_empty() {
-            app.pool.mark_auth_dead(&id, "no refresh_token on file");
+            // 无 refresh_token 的号上游 401 后无法自救：直接禁用 + 标注原因，
+            // 避免每次请求都被选中再触发一轮无意义的 spawn_refresh。
+            warn!(
+                account = %id,
+                "auth error and no refresh_token on file, disabling account"
+            );
+            app.pool
+                .disable_account(&id, "no refresh_token; account disabled");
             return;
         }
         let storage = acc.to_storage();

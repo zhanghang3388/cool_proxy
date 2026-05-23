@@ -529,6 +529,16 @@ pub fn mark_refresh_failed(pool: &SqlitePool, id: &str, msg: &str) -> Result<()>
     Ok(())
 }
 
+/// 直接把 reason 写到 last_error，不加任何前缀。给 disable_account 等明确事件用。
+pub fn set_last_error(pool: &SqlitePool, id: &str, msg: &str) -> Result<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE accounts SET last_error = ?2 WHERE id = ?1",
+        params![id, msg],
+    )?;
+    Ok(())
+}
+
 /// 给后台 refresher 用：所有 enabled 且 refresh_token 非空、且 (无 expire_at 或将在 threshold 秒内过期) 的账号。
 pub fn snapshot_for_refresh(
     pool: &SqlitePool,

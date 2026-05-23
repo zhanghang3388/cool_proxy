@@ -368,6 +368,13 @@ impl AccountPool {
         let _ = store_accounts::mark_refresh_failed(&self.db, id, msg);
     }
 
+    /// 永久禁用一个号（enabled=0），并写明原因。给"无 refresh_token 又被上游 401"这种
+    /// 不可自救的场景用，避免反复 spawn_refresh 造成噪音。
+    pub fn disable_account(&self, id: &str, reason: &str) {
+        let _ = store_accounts::set_enabled(&self.db, id, false);
+        let _ = store_accounts::set_last_error(&self.db, id, reason);
+    }
+
     pub fn set_enabled(&self, id: &str, enabled: bool) -> bool {
         store_accounts::set_enabled(&self.db, id, enabled).unwrap_or(false)
     }
