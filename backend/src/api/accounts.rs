@@ -335,7 +335,7 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
             (true, None)
         }
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{e:#}");
             app.pool.update_quota_error(&id, &msg);
             (false, Some(msg))
         }

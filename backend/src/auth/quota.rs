@@ -39,6 +39,8 @@ pub async fn fetch_codex_quota(
         .timeout(Duration::from_secs(30))
         .header("Accept", "application/json")
         .header("Authorization", format!("Bearer {access_token}"))
+        .header("Connection", "Keep-Alive")
+        .header("Originator", "codex_cli_rs")
         .header("User-Agent", CODEX_USER_AGENT);
 
     if !account_id.trim().is_empty() {

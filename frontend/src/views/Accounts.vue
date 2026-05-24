@@ -13,6 +13,7 @@ import {
   patchAccount, reloadFromDisk, exportToFiles, getStats, listProxies, setAccountProxy,
   refreshAccountQuota, refreshAccountQuotas,
 } from '../api'
+import type { QuotaRefreshItem } from '../api'
 
 const accounts = ref<AccountView[]>([])
 const proxies = ref<ProxyEntry[]>([])
@@ -29,9 +30,11 @@ const bulkQuotaLoading = ref(false)
 
 let timer: number | null = null
 let searchTimer: number | null = null
+let quotaSeq = 0
 
-async function refresh() {
+async function refresh(opts: { autoQuota?: boolean } = {}) {
   try {
+    const seq = ++quotaSeq
     const offset = (page.value - 1) * pageSize.value
     const q = search.value.trim() || undefined
     const [list, s, p] = await Promise.all([
@@ -43,23 +46,26 @@ async function refresh() {
     total.value = list.total
     stats.value = s
     proxies.value = p
+    if (opts.autoQuota && list.items.length > 0) {
+      await loadPageQuota(list.items.map((a) => a.id), { silent: true, seq })
+    }
   } catch (e) {
     message.error(`加载失败：${(e as Error).message}`)
   }
 }
 
-watch([page, pageSize], refresh)
+watch([page, pageSize], () => refresh({ autoQuota: true }))
 watch(search, () => {
   if (searchTimer) window.clearTimeout(searchTimer)
   searchTimer = window.setTimeout(() => {
     page.value = 1
-    refresh()
+    refresh({ autoQuota: true })
   }, 300)
 })
 
 onMounted(async () => {
   loading.value = true
-  await refresh()
+  await refresh({ autoQuota: true })
   loading.value = false
   timer = window.setInterval(refresh, 8000)
 })
@@ -314,9 +320,46 @@ async function doRefresh(id: string) {
   try {
     await refreshAccount(id)
     message.success('已刷新')
-    await refresh()
+    await refresh({ autoQuota: true })
   } catch (e) {
     message.error(`刷新失败：${(e as Error).message}`)
+  }
+}
+
+function applyQuotaResults(items: QuotaRefreshItem[]) {
+  const byId = new Map(items.filter((item) => item.quota).map((item) => [item.id, item.quota!]))
+  accounts.value = accounts.value.map((account) => {
+    const quota = byId.get(account.id)
+    return quota ? { ...account, quota } : account
+  })
+}
+
+async function loadPageQuota(
+  ids: string[],
+  opts: { silent?: boolean; seq?: number } = {},
+) {
+  if (!ids.length) return
+  bulkQuotaLoading.value = true
+  try {
+    const res = await refreshAccountQuotas(ids)
+    if (opts.seq !== undefined && opts.seq !== quotaSeq) return
+    applyQuotaResults(res.items)
+    const failed = res.items.filter((item) => !item.ok).length
+    if (!opts.silent) {
+      if (failed > 0) {
+        message.warning(`已刷新，${failed} 个账号查询失败`)
+      } else {
+        message.success(`已刷新 ${res.items.length} 个账号额度`)
+      }
+    }
+  } catch (e) {
+    if (!opts.silent) {
+      message.error(`批量刷新失败：${(e as Error).message}`)
+    }
+  } finally {
+    if (opts.seq === undefined || opts.seq === quotaSeq) {
+      bulkQuotaLoading.value = false
+    }
   }
 }
 
@@ -324,12 +367,12 @@ async function doRefreshQuota(id: string) {
   quotaLoading.value = { ...quotaLoading.value, [id]: true }
   try {
     const res = await refreshAccountQuota(id)
+    applyQuotaResults([res])
     if (res.ok) {
       message.success('额度已刷新')
     } else {
       message.warning(`额度查询失败：${res.error ?? 'unknown error'}`)
     }
-    await refresh()
   } catch (e) {
     message.error(`额度查询失败：${(e as Error).message}`)
   } finally {
@@ -341,22 +384,7 @@ async function doRefreshQuota(id: string) {
 
 async function doRefreshPageQuota() {
   const ids = accounts.value.map((a) => a.id)
-  if (!ids.length) return
-  bulkQuotaLoading.value = true
-  try {
-    const res = await refreshAccountQuotas(ids)
-    const failed = res.items.filter((item) => !item.ok).length
-    if (failed > 0) {
-      message.warning(`已刷新，${failed} 个账号查询失败`)
-    } else {
-      message.success(`已刷新 ${res.items.length} 个账号额度`)
-    }
-    await refresh()
-  } catch (e) {
-    message.error(`批量刷新失败：${(e as Error).message}`)
-  } finally {
-    bulkQuotaLoading.value = false
-  }
+  await loadPageQuota(ids)
 }
 
 async function doResetCooldown(id: string) {
@@ -482,7 +510,7 @@ async function submitPaste() {
           <n-button @click="handleExport">导出到 auths/</n-button>
           <n-button @click="handleReload">从磁盘重新加载</n-button>
           <n-button @click="doRefreshPageQuota" :loading="bulkQuotaLoading">刷新本页额度</n-button>
-          <n-button @click="refresh" :loading="loading">手动刷新</n-button>
+          <n-button @click="() => refresh({ autoQuota: true })" :loading="loading">手动刷新</n-button>
         </n-space>
       </template>
       <n-data-table
