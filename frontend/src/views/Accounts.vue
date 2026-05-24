@@ -2,7 +2,7 @@
 import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NCard, NDataTable, NSpace, NButton, NTag, NUpload, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
-  NSelect, NInput, NPagination, NModal, NAlert,
+  NSelect, NInput, NPagination, NModal, NAlert, NProgress,
   useMessage,
   type DataTableColumns,
   type UploadFileInfo,
@@ -11,6 +11,7 @@ import {
   AccountView, StatsView, ProxyEntry,
   listAccounts, uploadAccounts, importAccountsJson, deleteAccount, refreshAccount, resetCooldown,
   patchAccount, reloadFromDisk, exportToFiles, getStats, listProxies, setAccountProxy,
+  refreshAccountQuota, refreshAccountQuotas,
 } from '../api'
 
 const accounts = ref<AccountView[]>([])
@@ -23,6 +24,8 @@ const page = ref(1)
 const pageSize = ref(50)
 const total = ref(0)
 const search = ref('')
+const quotaLoading = ref<Record<string, boolean>>({})
+const bulkQuotaLoading = ref(false)
 
 let timer: number | null = null
 let searchTimer: number | null = null
@@ -74,6 +77,63 @@ function fmtTime(s: string | null): string {
   }
 }
 
+function fmtPercent(n: number | null | undefined): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return '-'
+  return `${Math.round(n)}%`
+}
+
+function quotaProgress(row: AccountView, key: 'five_hour' | 'week', label: string) {
+  const window = row.quota?.[key]
+  const remaining = window?.remaining_percent
+  const reset = window?.reset_at ? `，重置：${fmtTime(window.reset_at)}` : ''
+  const title = `${label} 剩余 ${fmtPercent(remaining)}${reset}`
+  return h('div', { class: 'quota-line', title }, [
+    h('span', { class: 'quota-label' }, label),
+    h(NProgress, {
+      type: 'line',
+      percentage: Math.round(remaining ?? 0),
+      height: 8,
+      borderRadius: 2,
+      fillBorderRadius: 2,
+      showIndicator: false,
+      processing: false,
+      status: remaining === undefined || remaining === null
+        ? 'default'
+        : remaining <= 15
+          ? 'error'
+          : remaining <= 35
+            ? 'warning'
+            : 'success',
+    }),
+    h('span', { class: 'quota-percent' }, fmtPercent(remaining)),
+  ])
+}
+
+function renderQuota(row: AccountView) {
+  if (row.quota?.error) {
+    return h(NSpace, { vertical: true, size: 4 }, {
+      default: () => [
+        h(NTag, { type: 'error', size: 'small', title: row.quota.error }, { default: () => '查询失败' }),
+        row.quota.checked_at
+          ? h('span', { class: 'quota-muted' }, fmtTime(row.quota.checked_at))
+          : null,
+      ],
+    })
+  }
+  if (!row.quota?.five_hour && !row.quota?.week) {
+    return h(NTag, { size: 'small' }, { default: () => '未查询' })
+  }
+  return h(NSpace, { vertical: true, size: 4, class: 'quota-box' }, {
+    default: () => [
+      quotaProgress(row, 'five_hour', '5h'),
+      quotaProgress(row, 'week', '周'),
+      row.quota.checked_at
+        ? h('span', { class: 'quota-muted' }, fmtTime(row.quota.checked_at))
+        : null,
+    ],
+  })
+}
+
 const columns = computed<DataTableColumns<AccountView>>(() => [
   { title: '邮箱', key: 'email', minWidth: 200, ellipsis: { tooltip: true } },
   {
@@ -81,6 +141,12 @@ const columns = computed<DataTableColumns<AccountView>>(() => [
     key: 'plan',
     width: 90,
     render: (row) => row.plan ?? '-',
+  },
+  {
+    title: '额度',
+    key: 'quota',
+    width: 230,
+    render: renderQuota,
   },
   {
     title: '状态',
@@ -207,7 +273,7 @@ const columns = computed<DataTableColumns<AccountView>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 220,
+    width: 300,
     render: (row) =>
       h(NSpace, { size: 4 }, {
         default: () => [
@@ -215,6 +281,15 @@ const columns = computed<DataTableColumns<AccountView>>(() => [
             NButton,
             { size: 'small', onClick: () => doRefresh(row.id) },
             { default: () => '刷新 token' },
+          ),
+          h(
+            NButton,
+            {
+              size: 'small',
+              loading: !!quotaLoading.value[row.id],
+              onClick: () => doRefreshQuota(row.id),
+            },
+            { default: () => '刷新额度' },
           ),
           h(
             NButton,
@@ -242,6 +317,45 @@ async function doRefresh(id: string) {
     await refresh()
   } catch (e) {
     message.error(`刷新失败：${(e as Error).message}`)
+  }
+}
+
+async function doRefreshQuota(id: string) {
+  quotaLoading.value = { ...quotaLoading.value, [id]: true }
+  try {
+    const res = await refreshAccountQuota(id)
+    if (res.ok) {
+      message.success('额度已刷新')
+    } else {
+      message.warning(`额度查询失败：${res.error ?? 'unknown error'}`)
+    }
+    await refresh()
+  } catch (e) {
+    message.error(`额度查询失败：${(e as Error).message}`)
+  } finally {
+    const next = { ...quotaLoading.value }
+    delete next[id]
+    quotaLoading.value = next
+  }
+}
+
+async function doRefreshPageQuota() {
+  const ids = accounts.value.map((a) => a.id)
+  if (!ids.length) return
+  bulkQuotaLoading.value = true
+  try {
+    const res = await refreshAccountQuotas(ids)
+    const failed = res.items.filter((item) => !item.ok).length
+    if (failed > 0) {
+      message.warning(`已刷新，${failed} 个账号查询失败`)
+    } else {
+      message.success(`已刷新 ${res.items.length} 个账号额度`)
+    }
+    await refresh()
+  } catch (e) {
+    message.error(`批量刷新失败：${(e as Error).message}`)
+  } finally {
+    bulkQuotaLoading.value = false
   }
 }
 
@@ -367,6 +481,7 @@ async function submitPaste() {
           <n-button @click="openPaste">粘贴 JSON</n-button>
           <n-button @click="handleExport">导出到 auths/</n-button>
           <n-button @click="handleReload">从磁盘重新加载</n-button>
+          <n-button @click="doRefreshPageQuota" :loading="bulkQuotaLoading">刷新本页额度</n-button>
           <n-button @click="refresh" :loading="loading">手动刷新</n-button>
         </n-space>
       </template>
@@ -375,7 +490,7 @@ async function submitPaste() {
         :data="accounts"
         :bordered="false"
         :row-key="(row: AccountView) => row.id"
-        :scroll-x="1620"
+        :scroll-x="1850"
         size="small"
       />
       <div style="margin-top: 12px; display: flex; justify-content: flex-end">
@@ -413,3 +528,33 @@ async function submitPaste() {
     </n-modal>
   </n-space>
 </template>
+
+<style scoped>
+.quota-box {
+  min-width: 190px;
+}
+
+.quota-line {
+  display: grid;
+  grid-template-columns: 24px minmax(120px, 1fr) 42px;
+  align-items: center;
+  column-gap: 6px;
+}
+
+.quota-label {
+  color: #606266;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.quota-muted {
+  color: #909399;
+  font-size: 12px;
+}
+
+.quota-percent {
+  color: #303133;
+  font-size: 12px;
+  text-align: right;
+}
+</style>

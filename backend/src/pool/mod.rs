@@ -279,11 +279,12 @@ impl AccountPool {
                         Some(label),
                     );
                 } else {
-                    let prev_lv = store_accounts::get_model_state(&self.db, ctx.id, model_for_state)
-                        .ok()
-                        .flatten()
-                        .map(|s| s.quota_backoff_lv)
-                        .unwrap_or(0);
+                    let prev_lv =
+                        store_accounts::get_model_state(&self.db, ctx.id, model_for_state)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.quota_backoff_lv)
+                            .unwrap_or(0);
                     let (cooldown, next_lv) = match ctx.retry_after {
                         Some(d) if !d.is_zero() => (d, prev_lv),
                         _ => quota_backoff(prev_lv),
@@ -436,6 +437,14 @@ impl AccountPool {
 
     pub fn mark_refresh_failed(&self, id: &str, msg: &str) {
         let _ = store_accounts::mark_refresh_failed(&self.db, id, msg);
+    }
+
+    pub fn update_quota(&self, id: &str, q: &store_accounts::AccountQuotaUpdate) -> bool {
+        store_accounts::update_quota(&self.db, id, q).unwrap_or(false)
+    }
+
+    pub fn update_quota_error(&self, id: &str, msg: &str) -> bool {
+        store_accounts::update_quota_error(&self.db, id, msg).unwrap_or(false)
     }
 
     pub fn reset_cooldown(&self, id: &str) -> bool {

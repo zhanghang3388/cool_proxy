@@ -117,6 +117,24 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_requests_account ON requests(account_id);
         ",
     )?;
+    ensure_column(conn, "accounts", "quota_5h_used_percent", "REAL")?;
+    ensure_column(conn, "accounts", "quota_5h_reset_at", "INTEGER")?;
+    ensure_column(conn, "accounts", "quota_week_used_percent", "REAL")?;
+    ensure_column(conn, "accounts", "quota_week_reset_at", "INTEGER")?;
+    ensure_column(conn, "accounts", "quota_checked_at", "INTEGER")?;
+    ensure_column(conn, "accounts", "quota_error", "TEXT")?;
+    Ok(())
+}
+
+fn ensure_column(conn: &rusqlite::Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for c in cols {
+        if c? == column {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     Ok(())
 }
 
@@ -136,7 +154,9 @@ pub struct Kv;
 impl Kv {
     pub fn get(conn: &rusqlite::Connection, k: &str) -> Result<Option<String>> {
         Ok(conn
-            .query_row("SELECT v FROM kv WHERE k = ?1", params![k], |r| r.get::<_, String>(0))
+            .query_row("SELECT v FROM kv WHERE k = ?1", params![k], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()?)
     }
 

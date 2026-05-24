@@ -10,6 +10,19 @@ export interface ModelStateView {
   quota_backoff_lv: number
 }
 
+export interface QuotaWindowView {
+  used_percent: number | null
+  remaining_percent: number | null
+  reset_at: string | null
+}
+
+export interface AccountQuotaView {
+  five_hour: QuotaWindowView | null
+  week: QuotaWindowView | null
+  checked_at: string | null
+  error: string | null
+}
+
 export interface AccountView {
   id: string
   email: string
@@ -28,6 +41,7 @@ export interface AccountView {
   proxy_url: string
   proxy_id: string | null
   model_states: ModelStateView[]
+  quota: AccountQuotaView
 }
 
 export interface AccountListResp {
@@ -35,6 +49,17 @@ export interface AccountListResp {
   items: AccountView[]
   limit: number
   offset: number
+}
+
+export interface QuotaRefreshItem {
+  id: string
+  ok: boolean
+  quota: AccountQuotaView | null
+  error: string | null
+}
+
+export interface QuotaRefreshResp {
+  items: QuotaRefreshItem[]
 }
 
 export interface ProxyEntry {
@@ -168,6 +193,14 @@ export async function deleteAccount(id: string): Promise<void> {
 }
 export async function refreshAccount(id: string): Promise<void> {
   await http.post(`/accounts/${encodeURIComponent(id)}/refresh`)
+}
+export async function refreshAccountQuota(id: string): Promise<QuotaRefreshItem> {
+  const { data } = await http.post<QuotaRefreshItem>(`/accounts/${encodeURIComponent(id)}/quota`)
+  return data
+}
+export async function refreshAccountQuotas(ids: string[]): Promise<QuotaRefreshResp> {
+  const { data } = await http.post<QuotaRefreshResp>('/accounts/quota/refresh', { ids })
+  return data
 }
 export async function resetCooldown(id: string): Promise<void> {
   await http.post(`/accounts/${encodeURIComponent(id)}/reset-cooldown`)

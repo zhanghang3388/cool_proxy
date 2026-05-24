@@ -29,6 +29,12 @@ pub struct AccountRow {
     pub total_requests: u64,
     pub total_failures: u64,
     pub proxy_url: String,
+    pub quota_5h_used_percent: Option<f64>,
+    pub quota_5h_reset_at: Option<DateTime<Utc>>,
+    pub quota_week_used_percent: Option<f64>,
+    pub quota_week_reset_at: Option<DateTime<Utc>>,
+    pub quota_checked_at: Option<DateTime<Utc>>,
+    pub quota_error: Option<String>,
     #[serde(skip)]
     pub raw_extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -61,6 +67,12 @@ impl AccountRow {
             total_requests: 0,
             total_failures: 0,
             proxy_url: storage.proxy_url.clone(),
+            quota_5h_used_percent: None,
+            quota_5h_reset_at: None,
+            quota_week_used_percent: None,
+            quota_week_reset_at: None,
+            quota_checked_at: None,
+            quota_error: None,
             raw_extra: storage.extra.clone(),
         }
     }
@@ -121,8 +133,23 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
         total_requests: r.get::<_, i64>("total_requests")? as u64,
         total_failures: r.get::<_, i64>("total_failures")? as u64,
         proxy_url: r.get("proxy_url")?,
+        quota_5h_used_percent: r.get("quota_5h_used_percent")?,
+        quota_5h_reset_at: ms_to_dt(r.get("quota_5h_reset_at")?),
+        quota_week_used_percent: r.get("quota_week_used_percent")?,
+        quota_week_reset_at: ms_to_dt(r.get("quota_week_reset_at")?),
+        quota_checked_at: ms_to_dt(r.get("quota_checked_at")?),
+        quota_error: r.get("quota_error")?,
         raw_extra,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountQuotaUpdate {
+    pub quota_5h_used_percent: Option<f64>,
+    pub quota_5h_reset_at: Option<DateTime<Utc>>,
+    pub quota_week_used_percent: Option<f64>,
+    pub quota_week_reset_at: Option<DateTime<Utc>>,
+    pub quota_error: Option<String>,
 }
 
 /// 全字段 upsert（导入 / 上传 / 替换都用它）。
@@ -224,8 +251,7 @@ pub fn list_page(
             rows.push(r?);
         }
     } else {
-        let mut stmt =
-            conn.prepare("SELECT * FROM accounts ORDER BY id LIMIT ?1 OFFSET ?2")?;
+        let mut stmt = conn.prepare("SELECT * FROM accounts ORDER BY id LIMIT ?1 OFFSET ?2")?;
         let it = stmt.query_map(params![limit, offset], row_to_account)?;
         for r in it {
             rows.push(r?);
@@ -340,9 +366,8 @@ pub fn get_model_state(
 
 pub fn list_model_states(pool: &SqlitePool, account_id: &str) -> Result<Vec<ModelStateRow>> {
     let conn = pool.get()?;
-    let mut stmt = conn.prepare(
-        "SELECT * FROM account_model_states WHERE account_id = ?1 ORDER BY model_key",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT * FROM account_model_states WHERE account_id = ?1 ORDER BY model_key")?;
     let it = stmt.query_map(params![account_id], row_to_model_state)?;
     Ok(it.filter_map(|r| r.ok()).collect())
 }
@@ -529,6 +554,41 @@ pub fn mark_refresh_failed(pool: &SqlitePool, id: &str, msg: &str) -> Result<()>
     Ok(())
 }
 
+pub fn update_quota(pool: &SqlitePool, id: &str, q: &AccountQuotaUpdate) -> Result<bool> {
+    let conn = pool.get()?;
+    let now = Utc::now().timestamp_millis();
+    let n = conn.execute(
+        "UPDATE accounts SET
+            quota_5h_used_percent = ?2,
+            quota_5h_reset_at = ?3,
+            quota_week_used_percent = ?4,
+            quota_week_reset_at = ?5,
+            quota_checked_at = ?6,
+            quota_error = ?7
+         WHERE id = ?1",
+        params![
+            id,
+            q.quota_5h_used_percent,
+            dt_to_ms(q.quota_5h_reset_at),
+            q.quota_week_used_percent,
+            dt_to_ms(q.quota_week_reset_at),
+            now,
+            q.quota_error,
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn update_quota_error(pool: &SqlitePool, id: &str, msg: &str) -> Result<bool> {
+    let conn = pool.get()?;
+    let now = Utc::now().timestamp_millis();
+    let n = conn.execute(
+        "UPDATE accounts SET quota_checked_at = ?2, quota_error = ?3 WHERE id = ?1",
+        params![id, now, msg],
+    )?;
+    Ok(n > 0)
+}
+
 /// 直接把 reason 写到 last_error，不加任何前缀。给 disable_account 等明确事件用。
 pub fn set_last_error(pool: &SqlitePool, id: &str, msg: &str) -> Result<()> {
     let conn = pool.get()?;
@@ -567,11 +627,10 @@ pub fn stats_overview(pool: &SqlitePool) -> Result<(usize, usize, usize, usize, 
     let conn = pool.get()?;
     let now_ms = Utc::now().timestamp_millis();
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
-    let enabled: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM accounts WHERE enabled = 1",
-        [],
-        |r| r.get(0),
-    )?;
+    let enabled: i64 =
+        conn.query_row("SELECT COUNT(*) FROM accounts WHERE enabled = 1", [], |r| {
+            r.get(0)
+        })?;
     let cooling: i64 = conn.query_row(
         "SELECT COUNT(*) FROM accounts WHERE cooldown_until IS NOT NULL AND cooldown_until > ?1",
         params![now_ms],

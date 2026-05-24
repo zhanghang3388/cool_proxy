@@ -17,12 +17,17 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/accounts", get(accounts::list).post(accounts::upload))
         .route("/accounts/import", post(accounts::import_json))
+        .route("/accounts/quota/refresh", post(accounts::refresh_quotas))
         .route(
             "/accounts/:id",
             delete(accounts::delete_one).patch(accounts::patch_one),
         )
         .route("/accounts/:id/refresh", post(accounts::manual_refresh))
-        .route("/accounts/:id/reset-cooldown", post(accounts::reset_cooldown))
+        .route("/accounts/:id/quota", post(accounts::refresh_quota))
+        .route(
+            "/accounts/:id/reset-cooldown",
+            post(accounts::reset_cooldown),
+        )
         .route("/accounts/:id/proxy", put(accounts::set_proxy))
         .route("/accounts/reload", post(accounts::reload))
         .route("/accounts/export", post(accounts::export_to_files))

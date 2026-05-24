@@ -4,13 +4,16 @@ use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
 
+use crate::auth::quota::{fetch_codex_quota, CodexQuotaSnapshot};
 use crate::auth::CodexTokenStorage;
 use crate::pool::{derive_account_id, derive_file_name};
 use crate::state::AppState;
+use crate::store::accounts::{AccountQuotaUpdate, AccountRow};
 
 /// 上传文件名清洗：拒绝任何带路径分隔符 / 父目录引用 / 隐藏文件 的输入，
 /// 只接受看起来像 `codex-*.json` 的纯文件名。返回 None 表示让调用方 fallback。
@@ -52,6 +55,21 @@ pub struct ModelStateView {
 }
 
 #[derive(Serialize)]
+pub struct QuotaWindowView {
+    pub used_percent: Option<f64>,
+    pub remaining_percent: Option<f64>,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AccountQuotaView {
+    pub five_hour: Option<QuotaWindowView>,
+    pub week: Option<QuotaWindowView>,
+    pub checked_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct AccountView {
     pub id: String,
     pub email: String,
@@ -70,6 +88,7 @@ pub struct AccountView {
     pub proxy_url: String,
     pub proxy_id: Option<String>,
     pub model_states: Vec<ModelStateView>,
+    pub quota: AccountQuotaView,
 }
 
 #[derive(Serialize)]
@@ -94,10 +113,40 @@ fn default_limit() -> i64 {
     50
 }
 
-pub async fn list(
-    State(app): State<Arc<AppState>>,
-    Query(q): Query<ListQuery>,
-) -> Response {
+fn quota_window_view(
+    used_percent: Option<f64>,
+    reset_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<QuotaWindowView> {
+    if used_percent.is_none() && reset_at.is_none() {
+        return None;
+    }
+    Some(QuotaWindowView {
+        used_percent,
+        remaining_percent: used_percent.map(|n| (100.0 - n).clamp(0.0, 100.0)),
+        reset_at: reset_at.map(|t| t.to_rfc3339()),
+    })
+}
+
+fn quota_view(a: &AccountRow) -> AccountQuotaView {
+    AccountQuotaView {
+        five_hour: quota_window_view(a.quota_5h_used_percent, a.quota_5h_reset_at),
+        week: quota_window_view(a.quota_week_used_percent, a.quota_week_reset_at),
+        checked_at: a.quota_checked_at.map(|t| t.to_rfc3339()),
+        error: a.quota_error.clone(),
+    }
+}
+
+fn quota_update_from_snapshot(snapshot: CodexQuotaSnapshot) -> AccountQuotaUpdate {
+    AccountQuotaUpdate {
+        quota_5h_used_percent: snapshot.five_hour.as_ref().and_then(|w| w.used_percent),
+        quota_5h_reset_at: snapshot.five_hour.as_ref().and_then(|w| w.reset_at),
+        quota_week_used_percent: snapshot.week.as_ref().and_then(|w| w.used_percent),
+        quota_week_reset_at: snapshot.week.as_ref().and_then(|w| w.reset_at),
+        quota_error: None,
+    }
+}
+
+pub async fn list(State(app): State<Arc<AppState>>, Query(q): Query<ListQuery>) -> Response {
     let now = chrono::Utc::now();
     let limit = q.limit.clamp(1, 500);
     let offset = q.offset.max(0);
@@ -129,6 +178,7 @@ pub async fn list(
                     quota_backoff_lv: s.quota_backoff_lv,
                 })
                 .collect();
+            let quota = quota_view(&a);
             AccountView {
                 expired: a.expire_at.map(|t| t <= now).unwrap_or(true),
                 id: a.id,
@@ -147,6 +197,7 @@ pub async fn list(
                 proxy_id: app.proxy_pool.id_by_url(&a.proxy_url),
                 proxy_url: a.proxy_url,
                 model_states: states,
+                quota,
             }
         })
         .collect();
@@ -210,10 +261,7 @@ pub async fn set_proxy(
     Json(json!({"ok": true})).into_response()
 }
 
-pub async fn delete_one(
-    State(app): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn delete_one(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if app.pool.remove(&id).is_none() {
         return (StatusCode::NOT_FOUND, "account not found").into_response();
     }
@@ -221,10 +269,7 @@ pub async fn delete_one(
     Json(json!({"ok": true})).into_response()
 }
 
-pub async fn manual_refresh(
-    State(app): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn manual_refresh(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let Some(acc) = app.pool.get(&id) else {
         return (StatusCode::NOT_FOUND, "account not found").into_response();
     };
@@ -246,10 +291,91 @@ pub async fn manual_refresh(
     }
 }
 
-pub async fn reset_cooldown(
+#[derive(Serialize)]
+pub struct QuotaRefreshItem {
+    pub id: String,
+    pub ok: bool,
+    pub quota: Option<AccountQuotaView>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct QuotaRefreshPayload {
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct QuotaRefreshResp {
+    pub items: Vec<QuotaRefreshItem>,
+}
+
+async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
+    let Some(acc) = app.pool.get(&id) else {
+        return QuotaRefreshItem {
+            id,
+            ok: false,
+            quota: None,
+            error: Some("account not found".to_string()),
+        };
+    };
+
+    let result = fetch_codex_quota(
+        &app.clients,
+        &acc.access_token,
+        &acc.account_id,
+        &acc.proxy_url,
+    )
+    .await;
+
+    let (ok, error) = match result {
+        Ok(snapshot) => {
+            let update = quota_update_from_snapshot(snapshot);
+            app.pool.update_quota(&id, &update);
+            (true, None)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            app.pool.update_quota_error(&id, &msg);
+            (false, Some(msg))
+        }
+    };
+
+    let quota = app.pool.get(&id).map(|a| quota_view(&a));
+    QuotaRefreshItem {
+        id,
+        ok,
+        quota,
+        error,
+    }
+}
+
+pub async fn refresh_quota(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let item = refresh_one_quota(app, id).await;
+    if item.quota.is_none() && item.error.as_deref() == Some("account not found") {
+        return (StatusCode::NOT_FOUND, "account not found").into_response();
+    }
+    Json(item).into_response()
+}
+
+pub async fn refresh_quotas(
     State(app): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Json(payload): Json<QuotaRefreshPayload>,
 ) -> Response {
+    let ids = if payload.ids.is_empty() {
+        app.pool.all_ids_sorted()
+    } else {
+        payload.ids
+    };
+    let items = stream::iter(ids)
+        .map(|id| refresh_one_quota(app.clone(), id))
+        .buffer_unordered(6)
+        .collect::<Vec<_>>()
+        .await;
+    Json(QuotaRefreshResp { items }).into_response()
+}
+
+pub async fn reset_cooldown(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if app.pool.reset_cooldown(&id) {
         Json(json!({"ok": true})).into_response()
     } else {
@@ -348,9 +474,7 @@ async fn import_one_storage(
         return Err(format!("{label}: missing access_token"));
     }
     if storage.refresh_token.is_empty() {
-        tracing::warn!(
-            "{label}: imported without refresh_token, will not be auto-refreshed"
-        );
+        tracing::warn!("{label}: imported without refresh_token, will not be auto-refreshed");
     }
     let id = derive_account_id(&storage);
     if storage.proxy_url.trim().is_empty() {
@@ -415,18 +539,14 @@ pub async fn import_json(
 }
 
 /// 上传 codex-*.json，写入 DB（不再落 auths/ 目录；要互通调用 export 接口）。
-pub async fn upload(
-    State(app): State<Arc<AppState>>,
-    mut multipart: Multipart,
-) -> Response {
+pub async fn upload(State(app): State<Arc<AppState>>, mut multipart: Multipart) -> Response {
     let mut imported: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     while let Some(field) = match multipart.next_field().await {
         Ok(f) => f,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("multipart error: {e}"))
-                .into_response();
+            return (StatusCode::BAD_REQUEST, format!("multipart error: {e}")).into_response();
         }
     } {
         let original_name = field.file_name().map(|s| s.to_string());
