@@ -284,7 +284,11 @@ fn push_user_history(
             content,
             model_id: Some(model_id.to_string()),
             origin: ORIGIN.to_string(),
-            images: if images.is_empty() { None } else { Some(images) },
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
             context,
         }),
         assistant_response_message: None,
@@ -328,10 +332,8 @@ fn extract_user_content(msg: &Value) -> Result<UserContent, String> {
                     "image" => {
                         if let Some(src) = block.get("source") {
                             if src.get("type").and_then(|v| v.as_str()) == Some("base64") {
-                                let media = src
-                                    .get("media_type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let media =
+                                    src.get("media_type").and_then(|v| v.as_str()).unwrap_or("");
                                 let fmt = media.split('/').nth(1).unwrap_or("");
                                 if media.starts_with("image/") && !fmt.is_empty() {
                                     let data = src
@@ -427,9 +429,10 @@ fn extract_assistant_content(
                         if id.is_empty() || name.is_empty() {
                             continue;
                         }
-                        let input = block.get("input").cloned().unwrap_or(Value::Object(
-                            serde_json::Map::new(),
-                        ));
+                        let input = block
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(Value::Object(serde_json::Map::new()));
                         if !input.is_object() {
                             return Err(format!("tool_use requires object input: {name}"));
                         }
@@ -454,7 +457,10 @@ fn extract_assistant_content(
     Ok(AssistantContent { content, tool_uses })
 }
 
-fn convert_tools(tools: Option<&Value>, to_kiro_name: &impl Fn(&str) -> String) -> Vec<KiroToolWrapper> {
+fn convert_tools(
+    tools: Option<&Value>,
+    to_kiro_name: &impl Fn(&str) -> String,
+) -> Vec<KiroToolWrapper> {
     let Some(arr) = tools.and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -470,7 +476,13 @@ fn convert_tools(tools: Option<&Value>, to_kiro_name: &impl Fn(&str) -> String) 
             .map(String::from)
             .unwrap_or_else(|| format!("Tool: {name}"));
         if description.len() > MAX_TOOL_DESC_LEN {
-            description.truncate(MAX_TOOL_DESC_LEN);
+            // 按字符边界截断：MAX_TOOL_DESC_LEN 是字节上限，直接 String::truncate 到字节
+            // 位置会在多字节 UTF-8 字符（中文 / emoji 等）中间 panic。
+            let mut end = MAX_TOOL_DESC_LEN;
+            while end > 0 && !description.is_char_boundary(end) {
+                end -= 1;
+            }
+            description.truncate(end);
             description.push_str("...");
         }
         let schema = tool
@@ -492,5 +504,42 @@ fn normalize_image_format(fmt: &str) -> String {
     match fmt.to_ascii_lowercase().as_str() {
         "jpg" | "jpeg" => "jpeg".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 回归：超长且全多字节字符的工具描述不应 panic（旧实现按字节 truncate 会在
+    /// 多字节字符中间切断而 panic），且应被安全截断。
+    #[test]
+    fn long_multibyte_tool_description_does_not_panic() {
+        let desc = "中".repeat(5000); // 每个 '中' 3 字节 => 15000 字节，远超 MAX_TOOL_DESC_LEN
+        let raw = json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "name": "do_thing",
+                "description": desc,
+                "input_schema": {"type": "object"}
+            }]
+        });
+        let t = translate(
+            &raw,
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/X",
+        )
+        .expect("translate should not fail");
+        let payload_json = serde_json::to_string(&t.payload).expect("payload serializes");
+        // 被截断：出现省略号、且不再包含完整原始串
+        assert!(
+            payload_json.contains("..."),
+            "description should be truncated"
+        );
+        assert!(
+            !payload_json.contains(&desc),
+            "full description must not survive"
+        );
     }
 }

@@ -215,7 +215,12 @@ fn extract_usage_payload(usage: Option<&Value>) -> UsageTuple {
             &["bonusCredits", "total"],
             &["bonus", "total"],
             &["usageBreakdowns", "bonus", "total"],
-            &["usageBreakdownList", "0", "freeTrialInfo", "usageLimitWithPrecision"],
+            &[
+                "usageBreakdownList",
+                "0",
+                "freeTrialInfo",
+                "usageLimitWithPrecision",
+            ],
             &["usageBreakdownList", "0", "freeTrialInfo", "usageLimit"],
         ],
     );
@@ -226,7 +231,12 @@ fn extract_usage_payload(usage: Option<&Value>) -> UsageTuple {
             &["bonusCredits", "used"],
             &["bonus", "used"],
             &["usageBreakdowns", "bonus", "used"],
-            &["usageBreakdownList", "0", "freeTrialInfo", "currentUsageWithPrecision"],
+            &[
+                "usageBreakdownList",
+                "0",
+                "freeTrialInfo",
+                "currentUsageWithPrecision",
+            ],
             &["usageBreakdownList", "0", "freeTrialInfo", "currentUsage"],
         ],
     );
@@ -237,7 +247,9 @@ fn extract_usage_payload(usage: Option<&Value>) -> UsageTuple {
             .or_else(|| usage.and_then(|value| get_path_value(value, &["resetTime"])))
             .or_else(|| usage.and_then(|value| get_path_value(value, &["resetOn"])))
             .or_else(|| usage.and_then(|value| get_path_value(value, &["nextDateReset"])))
-            .or_else(|| usage.and_then(|value| get_path_value(value, &["usageBreakdowns", "resetAt"]))),
+            .or_else(|| {
+                usage.and_then(|value| get_path_value(value, &["usageBreakdowns", "resetAt"]))
+            }),
     );
 
     let mut bonus_expire_days = pick_number(
@@ -260,10 +272,16 @@ fn extract_usage_payload(usage: Option<&Value>) -> UsageTuple {
     plan_name = plan_name.or_else(|| {
         pick_string(
             breakdown,
-            &[&["displayName"], &["displayNamePlural"], &["type"], &["unit"]],
+            &[
+                &["displayName"],
+                &["displayNamePlural"],
+                &["type"],
+                &["unit"],
+            ],
         )
     });
-    plan_tier = plan_tier.or_else(|| pick_string(breakdown, &[&["currency"], &["type"], &["unit"]]));
+    plan_tier =
+        plan_tier.or_else(|| pick_string(breakdown, &[&["currency"], &["type"], &["unit"]]));
 
     if credits_total.is_none() {
         credits_total = pick_number(
@@ -350,6 +368,13 @@ fn extract_usage_payload(usage: Option<&Value>) -> UsageTuple {
 
 fn resolve_usage_root(usage: Option<&Value>) -> Option<&Value> {
     let usage = usage?;
+    // 正确的嵌套遍历：kiro -> resourceNotifications -> usageState。
+    // （get_path_value 是逐元素 obj.get(key)，单个带点字符串只会去找名字真带点的扁平 key，
+    // 不会逐层下钻，因此这里必须拆成多段。）
+    if let Some(state) = get_path_value(usage, &["kiro", "resourceNotifications", "usageState"]) {
+        return Some(state);
+    }
+    // 兜底兼容：万一上游真用扁平点号 key。
     if let Some(state) = get_path_value(usage, &["kiro.resourceNotifications.usageState"]) {
         return Some(state);
     }
@@ -363,7 +388,9 @@ fn pick_usage_breakdown(usage: Option<&Value>) -> Option<&Value> {
     let usage = usage?;
     let list = get_path_value(usage, &["usageBreakdownList"])
         .and_then(|value| value.as_array())
-        .or_else(|| get_path_value(usage, &["usageBreakdowns"]).and_then(|value| value.as_array()))?;
+        .or_else(|| {
+            get_path_value(usage, &["usageBreakdowns"]).and_then(|value| value.as_array())
+        })?;
     if list.is_empty() {
         return None;
     }

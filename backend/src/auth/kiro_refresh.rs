@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::auth::kiro::{normalize_non_empty, parse_timestamp, pick_number, pick_string};
+use crate::auth::{InFlight, InFlightGuard};
 use crate::config::Config;
 use crate::pool::kiro::KiroPool;
 use crate::proxy::ProxiedClients;
@@ -24,11 +25,20 @@ const KIRO_AWS_OIDC_TOKEN_ENDPOINT_FMT: &str = "https://oidc.{region}.amazonaws.
 
 pub struct KiroRefresher {
     pub clients: Arc<ProxiedClients>,
+    in_flight: InFlight,
 }
 
 impl KiroRefresher {
     pub fn new(clients: Arc<ProxiedClients>) -> Self {
-        Self { clients }
+        Self {
+            clients,
+            in_flight: InFlight::default(),
+        }
+    }
+
+    /// 占用某账号的刷新槽位（single-flight 去重）。返回 `None` 表示已有刷新在进行。
+    pub fn begin_refresh(&self, id: &str) -> Option<InFlightGuard> {
+        self.in_flight.try_acquire(id)
     }
 
     /// 刷新一个账号的 token，返回写回 DB 用的更新集合。
@@ -37,9 +47,7 @@ impl KiroRefresher {
             .ok_or_else(|| anyhow::anyhow!("账号缺少 refresh_token，无法刷新"))?;
 
         let prefer_idc = acc.auth_method.eq_ignore_ascii_case("idc")
-            || (acc.idc_region.is_some()
-                && acc.client_id.is_some()
-                && acc.client_secret.is_some());
+            || (acc.idc_region.is_some() && acc.client_id.is_some() && acc.client_secret.is_some());
 
         let mut errors: Vec<String> = Vec::new();
         let mut token: Option<Value> = None;
@@ -55,7 +63,10 @@ impl KiroRefresher {
         }
 
         if token.is_none() {
-            match self.refresh_via_remote(&refresh_token, &acc.proxy_url).await {
+            match self
+                .refresh_via_remote(&refresh_token, &acc.proxy_url)
+                .await
+            {
                 Ok(t) => token = Some(t),
                 Err(e) => {
                     warn!(account = %acc.id, "refreshToken 接口刷新失败: {e}");
@@ -100,8 +111,8 @@ impl KiroRefresher {
                 body.chars().take(512).collect::<String>()
             );
         }
-        let parsed: Value =
-            serde_json::from_str(&body).with_context(|| format!("parse refresh response: {body}"))?;
+        let parsed: Value = serde_json::from_str(&body)
+            .with_context(|| format!("parse refresh response: {body}"))?;
         Ok(unwrap_token_response(parsed))
     }
 
@@ -260,7 +271,27 @@ pub async fn run_kiro_refresh_loop(
             continue;
         }
         debug!("kiro refresh scan: {} candidate(s)", candidates.len());
-        for acc in candidates {
+        let now = Utc::now();
+        let cutoff =
+            now + chrono::Duration::seconds(cfg.token_refresh.refresh_before_expire_seconds);
+        for snap in candidates {
+            // single-flight：跳过已有刷新在进行的账号（如 401 触发的按需刷新）。
+            let Some(_guard) = refresher.begin_refresh(&snap.id) else {
+                continue;
+            };
+            // 重新取最新账号，避免用 snapshot 里可能已被刷新过的旧 refresh_token。
+            let Some(acc) = pool.get(&snap.id) else {
+                continue;
+            };
+            if acc.refresh_token.is_empty() {
+                continue;
+            }
+            // 取到锁后再确认一次是否仍需刷新（可能在等待期间已被按需刷新过）。
+            if let Some(exp) = acc.expires_at {
+                if exp > cutoff {
+                    continue;
+                }
+            }
             match refresher.refresh(&acc).await {
                 Ok(update) => {
                     pool.update_after_refresh(&acc.id, &update);

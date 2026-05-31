@@ -6,7 +6,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::auth::CodexTokenStorage;
+use crate::auth::{CodexTokenStorage, InFlight, InFlightGuard};
 use crate::config::Config;
 use crate::pool::AccountPool;
 use crate::proxy::ProxiedClients;
@@ -25,11 +25,20 @@ struct RefreshResp {
 
 pub struct Refresher {
     pub clients: Arc<ProxiedClients>,
+    in_flight: InFlight,
 }
 
 impl Refresher {
     pub fn new(clients: Arc<ProxiedClients>) -> Self {
-        Self { clients }
+        Self {
+            clients,
+            in_flight: InFlight::default(),
+        }
+    }
+
+    /// 占用某账号的刷新槽位（single-flight 去重）。返回 `None` 表示已有刷新在进行。
+    pub fn begin_refresh(&self, id: &str) -> Option<InFlightGuard> {
+        self.in_flight.try_acquire(id)
     }
 
     /// 用 refresh_token 拿新的 access_token；通过 `proxy_url` 走对应的代理。
@@ -90,8 +99,29 @@ pub async fn run_refresh_loop(cfg: Arc<Config>, pool: Arc<AccountPool>, refreshe
             continue;
         }
         debug!("refresh scan: {} candidate(s)", candidates.len());
-        for (id, storage, _path, proxy_url) in candidates {
-            match refresher.refresh(&storage, &proxy_url).await {
+        let now = Utc::now();
+        let cutoff =
+            now + chrono::Duration::seconds(cfg.token_refresh.refresh_before_expire_seconds);
+        for (id, _storage, _path, _proxy_url) in candidates {
+            // single-flight：若该账号已有刷新在进行（如 401 触发的按需刷新），跳过本轮。
+            let Some(_guard) = refresher.begin_refresh(&id) else {
+                continue;
+            };
+            // 重新取最新账号，避免用 snapshot 里可能已被刷新过的旧 refresh_token。
+            let Some(acc) = pool.get(&id) else {
+                continue;
+            };
+            if acc.refresh_token.is_empty() {
+                continue;
+            }
+            // 取到锁后再确认一次：可能在等待期间已被按需刷新过，过期时间已远，无需再刷。
+            if let Some(exp) = acc.expire_at {
+                if exp > cutoff {
+                    continue;
+                }
+            }
+            let storage = acc.to_storage();
+            match refresher.refresh(&storage, &acc.proxy_url).await {
                 Ok(new_storage) => {
                     pool.update_after_refresh(&id, &new_storage);
                     info!(account = %id, email = %new_storage.email, "token refreshed");

@@ -473,6 +473,11 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// 401/auth 类失败：后台异步刷一次 token；失败则在账号上写 30min 冷却避免风暴。
 fn spawn_refresh(app: Arc<AppState>, id: String) {
     tokio::spawn(async move {
+        // single-flight：同一账号同一时刻只允许一次刷新在飞，避免并发请求各刷一次、
+        // 用同一个旧 refresh_token 互相把对方刷失败，从而误把健康账号标成 auth_dead。
+        let Some(_guard) = app.refresher.begin_refresh(&id) else {
+            return;
+        };
         let Some(acc) = app.pool.get(&id) else {
             return;
         };
@@ -992,6 +997,7 @@ fn stream_translate_response(
         let mut buf = bytes::BytesMut::new();
         let mut tail = bytes::BytesMut::with_capacity(32 * 1024);
         let mut completed = false;
+        let mut stream_err: Option<String> = None;
 
         while let Some(chunk) = up.next().await {
             match chunk {
@@ -1045,11 +1051,10 @@ fn stream_translate_response(
                     }
                 }
                 Err(e) => {
-                    let line = sse_error_event(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("upstream stream error: {e}"),
-                    );
+                    let msg = format!("upstream stream error: {e}");
+                    let line = sse_error_event(StatusCode::BAD_GATEWAY, &msg);
                     yield Ok(bytes::Bytes::from(line));
+                    stream_err = Some(msg);
                     break;
                 }
             }
@@ -1058,22 +1063,26 @@ fn stream_translate_response(
         // 流结束：发 [DONE]
         yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
 
-        // 写 RequestLog（usage 从 tail 解析），并标记成功
+        // 写 RequestLog（usage 从 tail 解析），按实际结果标记成功 / 状态码
         let (input, output, total) = parse_usage(&tail);
+        let (status_code, err_msg) = match &stream_err {
+            Some(e) => (502u16, Some(e.clone())),
+            None => (200u16, None),
+        };
         log.push(
             &log_method,
             &log_path,
             Some(log_acct),
             log_model,
-            200,
+            status_code,
             started.elapsed().as_millis() as u64,
             log_attempts,
             input,
             output,
             total,
-            None,
+            err_msg,
         );
-        if completed {
+        if stream_err.is_none() && completed {
             pool.report_success_for(&success_acct, &success_model);
         }
     };
@@ -1154,10 +1163,22 @@ async fn aggregate_translate_response(
                 }
             }
             Err(e) => {
-                return openai_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream stream error: {e}"),
+                // 流中途断开：记一条失败日志（之前这里直接返回、不留日志）。
+                let msg = format!("upstream stream error: {e}");
+                app.request_log.push(
+                    &method,
+                    "/responses",
+                    Some(account_id.clone()),
+                    Some(model.clone()),
+                    502,
+                    started.elapsed().as_millis() as u64,
+                    attempt_count,
+                    None,
+                    None,
+                    None,
+                    Some(msg.clone()),
                 );
+                return openai_error_response(StatusCode::BAD_GATEWAY, &msg);
             }
         }
     }

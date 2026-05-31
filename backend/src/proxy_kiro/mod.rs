@@ -164,7 +164,8 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
                     if code == 401 || code == 403 {
                         handle_auth_error(&app, &selected.id, code, &snippet);
                         auth_failed = true;
-                        endpoint_err = Some(format!("upstream {code} on {}: {snippet}", endpoint.name));
+                        endpoint_err =
+                            Some(format!("upstream {code} on {}: {snippet}", endpoint.name));
                         break;
                     }
                     // 429 / 其它：记下来换下一个端点再试
@@ -189,8 +190,8 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
             continue;
         };
 
-        // 成功：流式翻译 or 聚合
-        app.kiro_pool.report_success_for(&selected.id);
+        // 上游已返回 200。成功 / 失败的最终上报与请求日志改到流处理结束后按实际结果落，
+        // 避免"HTTP 200 但流中途断开"被错误地记成成功 + 200。
         if client_wants_stream {
             return stream_response(
                 app.clone(),
@@ -252,6 +253,11 @@ fn handle_auth_error(app: &Arc<AppState>, id: &str, status: u16, snippet: &str) 
 /// 401/403 触发的后台刷新：无 refresh_token 直接禁用，避免反复命中。
 fn spawn_kiro_refresh(app: Arc<AppState>, id: String) {
     tokio::spawn(async move {
+        // single-flight：同一账号同一时刻只允许一次刷新在飞，避免并发请求用同一个旧
+        // refresh_token 互相刷失败。
+        let Some(_guard) = app.kiro_refresher.begin_refresh(&id) else {
+            return;
+        };
         let Some(acc) = app.kiro_pool.get(&id) else {
             return;
         };
@@ -299,11 +305,14 @@ fn stream_response(
     use futures_util::StreamExt;
 
     let log = app.request_log.clone();
+    let pool = app.kiro_pool.clone();
+    let report_acct = account_id.clone();
     let s = async_stream::stream! {
         let mut parser = EventStreamParser::new();
         let mut proc = KiroEventProcessor::new();
         let mut encoder = ClaudeSseEncoder::new(model.clone(), restore);
         let mut upstream = resp.bytes_stream();
+        let mut stream_err: Option<String> = None;
 
         yield Ok::<_, std::io::Error>(bytes::Bytes::from(encoder.start(input_est)));
 
@@ -320,8 +329,10 @@ fn stream_response(
                     }
                 }
                 Err(e) => {
-                    let line = ClaudeSseEncoder::error(502, &format!("upstream stream error: {e}"));
+                    let msg = format!("upstream stream error: {e}");
+                    let line = ClaudeSseEncoder::error(502, &msg);
                     yield Ok(bytes::Bytes::from(line));
+                    stream_err = Some(msg);
                     break;
                 }
             }
@@ -336,20 +347,29 @@ fn stream_response(
         let usage = proc.usage.clone();
         yield Ok(bytes::Bytes::from(encoder.finish(&usage)));
 
-        // 写请求日志
+        // 按实际结果上报账号状态 + 写请求日志
+        let (status_code, err_msg) = match &stream_err {
+            Some(e) => (502u16, Some(e.clone())),
+            None => (200u16, None),
+        };
+        if stream_err.is_none() {
+            pool.report_success_for(&report_acct);
+        } else {
+            pool.report_failure_for(&report_acct, stream_err.as_deref().unwrap_or("stream error"));
+        }
         let total = usage.input_tokens + usage.output_tokens;
         log.push(
             &method,
             "/kiro/v1/messages",
             Some(account_id),
             Some(model),
-            200,
+            status_code,
             started.elapsed().as_millis() as u64,
             attempt_count,
             Some(usage.input_tokens),
             Some(usage.output_tokens),
             Some(total),
-            None,
+            err_msg,
         );
     };
 
@@ -359,7 +379,10 @@ fn stream_response(
         .body(body)
         .expect("build sse response");
     let h = out.headers_mut();
-    h.insert("content-type", HeaderValue::from_static("text/event-stream"));
+    h.insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     h.insert("cache-control", HeaderValue::from_static("no-cache"));
     h.insert("connection", HeaderValue::from_static("keep-alive"));
     out
@@ -392,16 +415,30 @@ async fn aggregate_response(
                 }
             }
             Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream stream error: {e}"),
+                // 流中途断开：按失败上报 + 记日志（之前这里既不上报也不记日志）。
+                let msg = format!("upstream stream error: {e}");
+                app.kiro_pool.report_failure_for(&account_id, &msg);
+                app.request_log.push(
+                    &method,
+                    "/kiro/v1/messages",
+                    Some(account_id.clone()),
+                    Some(model.clone()),
+                    502,
+                    started.elapsed().as_millis() as u64,
+                    attempt_count,
+                    None,
+                    None,
+                    None,
+                    Some(msg.clone()),
                 );
+                return anthropic_error(StatusCode::BAD_GATEWAY, &msg);
             }
         }
     }
     events.extend(proc.finalize());
     let usage = proc.usage.clone();
 
+    app.kiro_pool.report_success_for(&account_id);
     let total = usage.input_tokens + usage.output_tokens;
     app.request_log.push(
         &method,

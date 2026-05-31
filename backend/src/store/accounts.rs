@@ -607,12 +607,18 @@ pub fn snapshot_for_refresh(
     let conn = pool.get()?;
     let now_ms = Utc::now().timestamp_millis();
     let cutoff = now_ms + threshold_seconds * 1000;
+    // 未知过期时间（expire_at IS NULL）的账号不再每轮都刷：仅当从未刷新过、或距上次成功
+    // 刷新已超过一个 threshold 窗口时才纳入候选，避免每个扫描周期都对其打一次上游。
+    let stale_before = now_ms - threshold_seconds * 1000;
     let mut stmt = conn.prepare(
         "SELECT * FROM accounts
          WHERE enabled = 1 AND refresh_token <> ''
-           AND (expire_at IS NULL OR expire_at <= ?1)",
+           AND (
+             expire_at <= ?1
+             OR (expire_at IS NULL AND (last_refresh_at IS NULL OR last_refresh_at <= ?2))
+           )",
     )?;
-    let it = stmt.query_map(params![cutoff], row_to_account)?;
+    let it = stmt.query_map(params![cutoff, stale_before], row_to_account)?;
     let mut out = Vec::new();
     for r in it {
         let a = r?;

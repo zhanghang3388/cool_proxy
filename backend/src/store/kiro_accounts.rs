@@ -537,16 +537,25 @@ pub fn update_quota_error(pool: &SqlitePool, id: &str, msg: &str) -> Result<bool
 }
 
 /// 后台 refresher 用：所有 enabled 且 refresh_token 非空、且即将（threshold 秒内）过期的账号。
-pub fn snapshot_for_refresh(pool: &SqlitePool, threshold_seconds: i64) -> Result<Vec<KiroAccountRow>> {
+pub fn snapshot_for_refresh(
+    pool: &SqlitePool,
+    threshold_seconds: i64,
+) -> Result<Vec<KiroAccountRow>> {
     let conn = pool.get()?;
     let now_ms = Utc::now().timestamp_millis();
     let cutoff = now_ms + threshold_seconds * 1000;
+    // 未知过期时间（expires_at IS NULL）的账号不再每轮都刷：仅当从未刷新过、或距上次成功
+    // 刷新已超过一个 threshold 窗口时才纳入候选，避免每个扫描周期都对其打一次上游。
+    let stale_before = now_ms - threshold_seconds * 1000;
     let mut stmt = conn.prepare(
         "SELECT * FROM kiro_accounts
          WHERE enabled = 1 AND refresh_token <> ''
-           AND (expires_at IS NULL OR expires_at <= ?1)",
+           AND (
+             expires_at <= ?1
+             OR (expires_at IS NULL AND (last_refresh_at IS NULL OR last_refresh_at <= ?2))
+           )",
     )?;
-    let it = stmt.query_map(params![cutoff], row_to_account)?;
+    let it = stmt.query_map(params![cutoff, stale_before], row_to_account)?;
     let mut out = Vec::new();
     for r in it {
         out.push(r?);
