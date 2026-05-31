@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
+pub mod claude;
 pub mod kiro;
 
 use chrono::Utc;

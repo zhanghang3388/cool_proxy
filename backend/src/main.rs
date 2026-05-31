@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod pool;
 mod proxy;
+mod proxy_claude;
 mod proxy_kiro;
 mod proxy_pool;
 mod state;
@@ -18,6 +19,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::auth::claude_refresh::run_claude_refresh_loop;
 use crate::auth::kiro_refresh::run_kiro_refresh_loop;
 use crate::auth::refresher::run_refresh_loop;
 use crate::config::Config;
@@ -69,6 +71,14 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(run_kiro_refresh_loop(cfg, p, r));
     }
 
+    // Claude 后台 token 刷新
+    {
+        let cfg = config.clone();
+        let p = state.claude_pool.clone();
+        let r = state.claude_refresher.clone();
+        tokio::spawn(run_claude_refresh_loop(cfg, p, r));
+    }
+
     let cors = CorsLayer::new()
         .allow_methods(Any)
         .allow_headers(Any)
@@ -104,6 +114,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/kiro/v1/models",
             axum::routing::get(proxy_kiro::models_handler),
+        )
+        // Claude 反代（Anthropic Messages API，OAuth 令牌转发到 api.anthropic.com）
+        .route(
+            "/claude/v1/messages",
+            axum::routing::post(proxy_claude::messages_handler),
+        )
+        .route(
+            "/claude/v1/models",
+            axum::routing::get(proxy_claude::models_handler),
         )
         .with_state(state.clone());
 

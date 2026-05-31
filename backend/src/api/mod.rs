@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod auth;
+pub mod claude_accounts;
 pub mod kiro_accounts;
 pub mod logs;
 pub mod proxies;
@@ -71,6 +72,27 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/kiro/accounts/:id/proxy", put(kiro_accounts::set_proxy))
         .route("/kiro/stats", get(kiro_accounts::stats))
+        // ===== Claude 账号池 =====
+        .route("/claude/accounts", get(claude_accounts::list))
+        .route("/claude/login/start", post(claude_accounts::login_start))
+        .route("/claude/login/finish", post(claude_accounts::login_finish))
+        .route(
+            "/claude/accounts/:id",
+            delete(claude_accounts::delete_one).patch(claude_accounts::patch_one),
+        )
+        .route(
+            "/claude/accounts/:id/refresh",
+            post(claude_accounts::manual_refresh),
+        )
+        .route(
+            "/claude/accounts/:id/reset-cooldown",
+            post(claude_accounts::reset_cooldown),
+        )
+        .route(
+            "/claude/accounts/:id/proxy",
+            put(claude_accounts::set_proxy),
+        )
+        .route("/claude/stats", get(claude_accounts::stats))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::admin_guard,

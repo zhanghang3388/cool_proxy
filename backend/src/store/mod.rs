@@ -8,6 +8,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod claude_accounts;
 pub mod kiro_accounts;
 pub mod proxies;
 pub mod requests;
@@ -168,6 +169,30 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_kiro_enabled ON kiro_accounts(enabled);
         CREATE INDEX IF NOT EXISTS idx_kiro_email ON kiro_accounts(email);
         CREATE INDEX IF NOT EXISTS idx_kiro_proxy ON kiro_accounts(proxy_url);
+
+        -- Claude（Anthropic OAuth / Claude Code）账号池：和 kiro_accounts 平行的一张表。
+        CREATE TABLE IF NOT EXISTS claude_accounts (
+            id              TEXT PRIMARY KEY,
+            email           TEXT NOT NULL DEFAULT '',
+            org_name        TEXT,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            access_token    TEXT NOT NULL DEFAULT '',
+            refresh_token   TEXT NOT NULL DEFAULT '',
+            expires_at      INTEGER,           -- unix ms
+            last_refresh_at INTEGER,
+            failure_count   INTEGER NOT NULL DEFAULT 0,
+            cooldown_until  INTEGER,
+            last_error      TEXT,
+            last_used_at    INTEGER,
+            total_requests  INTEGER NOT NULL DEFAULT 0,
+            total_failures  INTEGER NOT NULL DEFAULT 0,
+            proxy_url       TEXT NOT NULL DEFAULT '',
+            raw_auth_token  TEXT NOT NULL DEFAULT '{}',
+            created_at      INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
+        );
+        CREATE INDEX IF NOT EXISTS idx_claude_enabled ON claude_accounts(enabled);
+        CREATE INDEX IF NOT EXISTS idx_claude_email ON claude_accounts(email);
+        CREATE INDEX IF NOT EXISTS idx_claude_proxy ON claude_accounts(proxy_url);
         ",
     )?;
     ensure_column(conn, "accounts", "quota_5h_used_percent", "REAL")?;

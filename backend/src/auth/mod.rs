@@ -1,3 +1,5 @@
+pub mod claude;
+pub mod claude_refresh;
 pub mod codex;
 pub mod kiro;
 pub mod kiro_quota;

@@ -409,6 +409,89 @@ export async function getKiroStats(): Promise<KiroStatsView> {
   return data
 }
 
+// ===== Claude 账号池 =====
+
+export interface ClaudeAccountView {
+  id: string
+  email: string
+  org_name: string | null
+  enabled: boolean
+  expire_at: string | null
+  last_refresh_at: string | null
+  last_used_at: string | null
+  failure_count: number
+  cooldown_until: string | null
+  last_error: string | null
+  total_requests: number
+  total_failures: number
+  expired: boolean
+  proxy_url: string
+  proxy_id: string | null
+}
+
+export interface ClaudeAccountListResp {
+  total: number
+  items: ClaudeAccountView[]
+  limit: number
+  offset: number
+}
+
+export interface ClaudeStatsView {
+  total_accounts: number
+  enabled_accounts: number
+  cooling_down: number
+  expired: number
+  total_requests: number
+  total_failures: number
+}
+
+export interface ClaudeLoginStartResp {
+  auth_url: string
+  state: string
+}
+
+export async function listClaudeAccounts(
+  params: { limit?: number; offset?: number; q?: string } = {},
+): Promise<ClaudeAccountListResp> {
+  const { data } = await http.get<ClaudeAccountListResp>('/claude/accounts', { params })
+  return data
+}
+export async function patchClaudeAccount(id: string, payload: { enabled?: boolean }): Promise<void> {
+  await http.patch(`/claude/accounts/${encodeURIComponent(id)}`, payload)
+}
+export async function deleteClaudeAccount(id: string): Promise<void> {
+  await http.delete(`/claude/accounts/${encodeURIComponent(id)}`)
+}
+export async function refreshClaudeAccount(id: string): Promise<void> {
+  await http.post(`/claude/accounts/${encodeURIComponent(id)}/refresh`)
+}
+export async function resetClaudeCooldown(id: string): Promise<void> {
+  await http.post(`/claude/accounts/${encodeURIComponent(id)}/reset-cooldown`)
+}
+export async function setClaudeAccountProxy(
+  id: string,
+  payload: { proxy_id?: string; url?: string },
+): Promise<void> {
+  await http.put(`/claude/accounts/${encodeURIComponent(id)}/proxy`, payload)
+}
+export async function getClaudeStats(): Promise<ClaudeStatsView> {
+  const { data } = await http.get<ClaudeStatsView>('/claude/stats')
+  return data
+}
+export async function claudeLoginStart(): Promise<ClaudeLoginStartResp> {
+  const { data } = await http.post<ClaudeLoginStartResp>('/claude/login/start')
+  return data
+}
+export async function claudeLoginFinish(payload: {
+  state: string
+  code: string
+  proxy_id?: string
+  url?: string
+}): Promise<{ ok: boolean; account: ClaudeAccountView }> {
+  const { data } = await http.post('/claude/login/finish', payload)
+  return data
+}
+
 export async function ping(): Promise<boolean> {
   try {
     await http.get('/stats')

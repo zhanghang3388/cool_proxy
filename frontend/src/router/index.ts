@@ -15,6 +15,7 @@ const routes: RouteRecordRaw[] = [
     children: [
       { path: 'accounts', name: 'accounts', component: () => import('../views/Accounts.vue') },
       { path: 'kiro', name: 'kiro', component: () => import('../views/KiroAccounts.vue') },
+      { path: 'claude', name: 'claude', component: () => import('../views/ClaudeAccounts.vue') },
       { path: 'proxies', name: 'proxies', component: () => import('../views/Proxies.vue') },
       { path: 'logs', name: 'logs', component: () => import('../views/Logs.vue') },
       { path: 'usage', name: 'usage', component: () => import('../views/Usage.vue') },
