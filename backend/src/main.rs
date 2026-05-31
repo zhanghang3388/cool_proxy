@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod pool;
 mod proxy;
+mod proxy_kiro;
 mod proxy_pool;
 mod state;
 mod store;
@@ -92,6 +93,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/backend-api/codex/responses/*rest",
             any(proxy::proxy_handler),
+        )
+        // Kiro 反代（Anthropic Messages API，独立 /kiro 前缀，不与 codex 冲突）
+        .route(
+            "/kiro/v1/messages",
+            axum::routing::post(proxy_kiro::messages_handler),
+        )
+        .route(
+            "/kiro/v1/models",
+            axum::routing::get(proxy_kiro::models_handler),
         )
         .with_state(state.clone());
 

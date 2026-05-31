@@ -29,8 +29,35 @@ pub enum KiroPoolError {
 pub struct SelectedKiroAccount {
     pub id: String,
     pub access_token: String,
-    pub profile_arn: Option<String>,
+    pub profile_arn: String,
+    pub auth_method: String,
+    pub login_provider: Option<String>,
     pub proxy_url: String,
+}
+
+/// social 登录（Google/Github）兜底 profileArn。
+const KIRO_SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+/// Builder-ID / IdC 兜底 profileArn。
+const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
+/// 解析账号最终用于上游的 profileArn：账号自带优先，否则按登录方式兜底。
+pub fn resolve_profile_arn(acc: &KiroAccountRow) -> String {
+    if let Some(arn) = acc.profile_arn.as_deref() {
+        if !arn.trim().is_empty() {
+            return arn.to_string();
+        }
+    }
+    let provider = acc.login_provider.as_deref().unwrap_or("").to_ascii_lowercase();
+    if provider == "github" || provider == "google" {
+        KIRO_SOCIAL_PROFILE_ARN.to_string()
+    } else if acc.auth_method.eq_ignore_ascii_case("idc") {
+        KIRO_BUILDER_ID_PROFILE_ARN.to_string()
+    } else {
+        // 默认按 social 兜底（大多数导入账号是社交登录）
+        KIRO_SOCIAL_PROFILE_ARN.to_string()
+    }
 }
 
 pub struct KiroPool {
@@ -86,8 +113,7 @@ impl KiroPool {
         self.ids.read().unwrap().clone()
     }
 
-    /// round-robin 选一个可用账号（账号级 cooldown / enabled 过滤）。预留给反代。
-    #[allow(dead_code)]
+    /// round-robin 选一个可用账号（账号级 cooldown / enabled 过滤）。给反代用。
     pub fn pick(&self) -> Result<SelectedKiroAccount, KiroPoolError> {
         let now = Utc::now();
         let ids = self.ids.read().unwrap();
@@ -106,14 +132,51 @@ impl KiroPool {
                 continue;
             }
             let _ = store_kiro::mark_used(&self.db, id);
+            let profile_arn = resolve_profile_arn(&a);
             return Ok(SelectedKiroAccount {
                 id: a.id,
                 access_token: a.access_token,
-                profile_arn: a.profile_arn,
+                profile_arn,
+                auth_method: a.auth_method,
+                login_provider: a.login_provider,
                 proxy_url: a.proxy_url,
             });
         }
         Err(KiroPoolError::AllUnavailable)
+    }
+
+    /// 成功上报：清失败计数与冷却。
+    pub fn report_success_for(&self, id: &str) {
+        let _ = store_kiro::report_success(&self.db, id);
+    }
+
+    /// 失败上报：按配置决定是否冷却。返回是否进入了冷却（仅用于日志）。
+    pub fn report_failure_for(&self, id: &str, msg: &str) {
+        if self.cfg.retry.disable_cooldown {
+            let _ = store_kiro::mark_refresh_failed(&self.db, id, msg);
+            return;
+        }
+        let _ = store_kiro::report_failure(
+            &self.db,
+            id,
+            msg,
+            self.cfg.retry.cooldown_seconds as i64,
+            self.cfg.retry.long_cooldown_seconds as i64,
+            self.cfg.retry.failure_threshold,
+        );
+    }
+
+    /// 标记账号被封禁（403 + SUSPENDED 之类），写 status + 禁用避免反复命中。
+    pub fn mark_banned(&self, id: &str, reason: &str) {
+        let _ = store_kiro::set_enabled(&self.db, id, false);
+        let q = crate::store::kiro_accounts::KiroQuotaUpdate {
+            status: Some(crate::auth::kiro::KIRO_STATUS_BANNED.to_string()),
+            status_reason: Some(reason.to_string()),
+            quota_error: Some(reason.to_string()),
+            raw_usage: None,
+            ..Default::default()
+        };
+        let _ = store_kiro::update_quota(&self.db, id, &q);
     }
 
     /// 导入 / 替换一个账号。自动派生稳定 id。
@@ -154,22 +217,6 @@ impl KiroPool {
 
     pub fn report_success(&self, id: &str) {
         let _ = store_kiro::report_success(&self.db, id);
-    }
-
-    #[allow(dead_code)]
-    pub fn report_failure(&self, id: &str, msg: &str) {
-        if self.cfg.retry.disable_cooldown {
-            let _ = store_kiro::mark_refresh_failed(&self.db, id, msg);
-            return;
-        }
-        let _ = store_kiro::report_failure(
-            &self.db,
-            id,
-            msg,
-            self.cfg.retry.cooldown_seconds as i64,
-            self.cfg.retry.long_cooldown_seconds as i64,
-            self.cfg.retry.failure_threshold,
-        );
     }
 
     pub fn snapshot_for_refresh(&self, threshold_seconds: i64) -> Vec<KiroAccountRow> {
