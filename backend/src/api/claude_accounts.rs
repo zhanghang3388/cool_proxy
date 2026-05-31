@@ -228,7 +228,8 @@ pub async fn login_finish(
     State(app): State<Arc<AppState>>,
     Json(payload): Json<LoginFinishPayload>,
 ) -> Response {
-    let Some(verifier) = app.claude_login.take(&payload.state) else {
+    // peek 不消费：换 token 失败时保留 verifier，用户改正授权码后可直接重试。
+    let Some(verifier) = app.claude_login.peek(&payload.state) else {
         return (
             StatusCode::BAD_REQUEST,
             "登录已过期或 state 无效，请重新获取授权链接",
@@ -255,6 +256,8 @@ pub async fn login_finish(
         Ok(d) => d,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
     };
+    // 换 token 成功，消费掉这次登录的 state。
+    app.claude_login.remove(&payload.state);
 
     let acc = match app.claude_pool.add_or_replace(&data) {
         Ok(a) => a,
@@ -274,6 +277,65 @@ pub async fn login_finish(
     let now = chrono::Utc::now();
     let view = account_view(&app, app.claude_pool.get(&acc.id).unwrap_or(acc), now);
     Json(json!({"ok": true, "account": view})).into_response()
+}
+
+// ===== 重新分配代理（与 codex 一致：从共享代理池 round-robin，可复用、不独占）=====
+
+#[derive(Deserialize)]
+pub struct RebalancePayload {
+    /// only_unassigned=true 仅给当前没绑代理的账号分配；
+    /// false 表示把所有 Claude 账号重新轮询分配（覆盖现有绑定）。
+    #[serde(default)]
+    pub only_unassigned: bool,
+}
+
+#[derive(Serialize)]
+pub struct RebalanceResult {
+    pub assigned: usize,
+    pub skipped_no_proxies: bool,
+    pub failed: Vec<String>,
+}
+
+pub async fn rebalance(
+    State(app): State<Arc<AppState>>,
+    Json(payload): Json<RebalancePayload>,
+) -> Response {
+    let proxies = app.proxy_pool.list();
+    if proxies.is_empty() {
+        return Json(RebalanceResult {
+            assigned: 0,
+            skipped_no_proxies: true,
+            failed: vec![],
+        })
+        .into_response();
+    }
+
+    let ids = if payload.only_unassigned {
+        app.claude_pool.unassigned_ids()
+    } else {
+        app.claude_pool.all_ids_sorted()
+    };
+
+    let mut assigned = 0;
+    let mut failed = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let url = proxies[i % proxies.len()].url.clone();
+        match app.claude_pool.set_proxy(id, url) {
+            Ok(()) => assigned += 1,
+            Err(e) => failed.push(format!("{id}: {e}")),
+        }
+    }
+    info!(
+        assigned,
+        only_unassigned = payload.only_unassigned,
+        "claude rebalance done"
+    );
+    Json(RebalanceResult {
+        assigned,
+        skipped_no_proxies: false,
+        failed,
+    })
+    .into_response()
 }
 
 // ===== 统计 =====

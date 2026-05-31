@@ -74,6 +74,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/kiro/stats", get(kiro_accounts::stats))
         // ===== Claude 账号池 =====
         .route("/claude/accounts", get(claude_accounts::list))
+        .route(
+            "/claude/accounts/rebalance",
+            post(claude_accounts::rebalance),
+        )
         .route("/claude/login/start", post(claude_accounts::login_start))
         .route("/claude/login/finish", post(claude_accounts::login_finish))
         .route(

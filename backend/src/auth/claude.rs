@@ -91,15 +91,91 @@ pub fn derive_claude_account_id(data: &ClaudeTokenData) -> String {
     format!("claude-acc-{}", &hex::encode(digest)[..12])
 }
 
-/// 授权页回调里复制回来的 code 可能形如 `code#state`，拆开。
+/// 从用户回填的内容里抽出授权码与 state。兼容四种粘贴形式：
+///  1. 整段回调 URL：`http://localhost:54545/callback?code=XXX&state=YYY`
+///  2. 查询串：`?code=XXX&state=YYY` 或 `code=XXX&state=YYY`
+///  3. 手动 console 流：`code#state`
+///  4. 纯 code
 fn split_code_and_state(raw: &str) -> (String, Option<String>) {
-    let mut parts = raw.trim().splitn(2, '#');
+    let raw = raw.trim();
+
+    // 形式 1/2：能解析出 code 查询参数就优先用它（顺带拿 state）。
+    let as_url = if raw.starts_with("http://") || raw.starts_with("https://") {
+        reqwest::Url::parse(raw).ok()
+    } else if raw.contains("code=") {
+        reqwest::Url::parse(&format!(
+            "http://localhost/?{}",
+            raw.trim_start_matches('?')
+        ))
+        .ok()
+    } else {
+        None
+    };
+    if let Some(url) = as_url {
+        let mut code = None;
+        let mut state = None;
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "code" => code = Some(v.into_owned()),
+                "state" => state = Some(v.into_owned()),
+                _ => {}
+            }
+        }
+        if let Some(c) = code {
+            let c = c.trim().to_string();
+            if !c.is_empty() {
+                return (
+                    c,
+                    state
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+        }
+    }
+
+    // 形式 3/4：code#state 或纯 code。
+    let mut parts = raw.splitn(2, '#');
     let code = parts.next().unwrap_or("").trim().to_string();
     let state = parts
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     (code, state)
+}
+
+#[cfg(test)]
+mod code_parse_tests {
+    use super::split_code_and_state;
+
+    #[test]
+    fn parses_full_callback_url() {
+        let (code, state) =
+            split_code_and_state("http://localhost:54545/callback?code=mdo3CExM&state=f992a25e");
+        assert_eq!(code, "mdo3CExM");
+        assert_eq!(state.as_deref(), Some("f992a25e"));
+    }
+
+    #[test]
+    fn parses_bare_query_string() {
+        let (code, state) = split_code_and_state("code=abc123&state=xyz");
+        assert_eq!(code, "abc123");
+        assert_eq!(state.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn parses_hash_form() {
+        let (code, state) = split_code_and_state("abc#xyz");
+        assert_eq!(code, "abc");
+        assert_eq!(state.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn parses_bare_code() {
+        let (code, state) = split_code_and_state("just-a-code");
+        assert_eq!(code, "just-a-code");
+        assert_eq!(state, None);
+    }
 }
 
 /// 把 token 接口返回体规整成 [`ClaudeTokenData`]。
@@ -276,11 +352,17 @@ impl ClaudeLoginStore {
         Ok((auth_url, state))
     }
 
-    /// 取出并消费某个 state 对应的 verifier（一次性）。
-    pub fn take(&self, state: &str) -> Option<String> {
+    /// 读取（不消费）某 state 对应的 verifier。换 token 失败时保留，便于改正授权码后重试。
+    pub fn peek(&self, state: &str) -> Option<String> {
         let mut map = self.pending.lock().unwrap();
         prune(&mut map);
-        map.remove(state).map(|p| p.verifier)
+        map.get(state).map(|p| p.verifier.clone())
+    }
+
+    /// 登录成功后消费掉该 state。
+    pub fn remove(&self, state: &str) {
+        let mut map = self.pending.lock().unwrap();
+        map.remove(state);
     }
 }
 

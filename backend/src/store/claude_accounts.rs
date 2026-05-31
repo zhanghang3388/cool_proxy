@@ -226,6 +226,18 @@ pub fn all_ids_sorted(pool: &SqlitePool) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// 当前没绑代理（proxy_url = ''）的账号 id。给"仅未分配"的重新分配用。
+pub fn unassigned_ids(pool: &SqlitePool) -> Result<Vec<String>> {
+    let conn = pool.get()?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM claude_accounts WHERE proxy_url = '' ORDER BY id")?;
+    let ids: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(ids)
+}
+
 pub fn delete(pool: &SqlitePool, id: &str) -> Result<bool> {
     let conn = pool.get()?;
     let n = conn.execute("DELETE FROM claude_accounts WHERE id = ?1", params![id])?;

@@ -2,7 +2,7 @@
 import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NCard, NDataTable, NSpace, NButton, NTag, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
-  NSelect, NInput, NPagination, NModal, NAlert,
+  NSelect, NInput, NPagination, NModal, NAlert, NCheckbox,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
@@ -10,7 +10,7 @@ import {
   ClaudeAccountView, ClaudeStatsView, ProxyEntry,
   listClaudeAccounts, deleteClaudeAccount, refreshClaudeAccount, resetClaudeCooldown,
   patchClaudeAccount, getClaudeStats, listProxies, setClaudeAccountProxy,
-  claudeLoginStart, claudeLoginFinish,
+  claudeLoginStart, claudeLoginFinish, rebalanceClaudeProxies,
 } from '../api'
 
 const accounts = ref<ClaudeAccountView[]>([])
@@ -297,6 +297,29 @@ async function copyAuthUrl() {
     message.warning('复制失败，请手动选择链接复制')
   }
 }
+
+// ===== 重新分配代理（与 codex 一致：从共享代理池 round-robin，可复用）=====
+const showRebalance = ref(false)
+const onlyUnassigned = ref(true)
+const rebalanceBusy = ref(false)
+
+async function doRebalance() {
+  rebalanceBusy.value = true
+  try {
+    const r = await rebalanceClaudeProxies(onlyUnassigned.value)
+    if (r.skipped_no_proxies) {
+      message.warning('代理池为空，无操作')
+    } else {
+      message.success(`已分配 ${r.assigned} 个账号` + (r.failed.length ? `，${r.failed.length} 个失败` : ''))
+    }
+    showRebalance.value = false
+    await refresh()
+  } catch (e) {
+    message.error(`重新分配失败：${(e as Error).message}`)
+  } finally {
+    rebalanceBusy.value = false
+  }
+}
 </script>
 
 <template>
@@ -320,6 +343,7 @@ async function copyAuthUrl() {
             size="small"
           />
           <n-button type="primary" @click="openLogin">添加账号（OAuth 登录）</n-button>
+          <n-button @click="showRebalance = true">重新分配代理</n-button>
           <n-button @click="refresh" :loading="loading">手动刷新</n-button>
         </n-space>
       </template>
@@ -371,13 +395,14 @@ async function copyAuthUrl() {
           <n-alert type="success" :show-icon="false">
             已在新标签打开授权页。若没弹出，<a :href="authUrl" target="_blank">点此打开</a>，或
             <a href="javascript:void(0)" @click="copyAuthUrl">复制链接</a>。<br />
-            授权后页面会显示一段授权码（形如 <code>xxxx#yyyy</code>），整段复制粘贴到下面。
+            授权后浏览器会跳到 <code>http://localhost:54545/callback?code=...</code>（页面打不开是正常的，本机没有监听）。
+            <b>直接把地址栏那一整条 URL 复制粘贴到下面即可</b>，也可只粘 <code>code</code> 的值。
           </n-alert>
           <n-input
             v-model:value="loginCode"
             type="textarea"
             :autosize="{ minRows: 2, maxRows: 4 }"
-            placeholder="粘贴授权码"
+            placeholder="粘贴整段回调 URL，或 code 值"
             spellcheck="false"
           />
           <n-space justify="space-between">
@@ -388,6 +413,19 @@ async function copyAuthUrl() {
             </n-space>
           </n-space>
         </template>
+      </n-space>
+    </n-modal>
+
+    <n-modal v-model:show="showRebalance" preset="card" title="重新分配代理" style="width: 480px">
+      <n-space vertical :size="12">
+        <n-checkbox v-model:checked="onlyUnassigned">仅给未分配代理的账号分配</n-checkbox>
+        <n-alert v-if="!onlyUnassigned" type="warning" :show-icon="false">
+          这会把所有 Claude 账号按 round-robin 重新分配代理，覆盖现有绑定！代理可被多个账号 / 多种账号类型共用（不独占）。
+        </n-alert>
+        <n-space justify="end">
+          <n-button @click="showRebalance = false">取消</n-button>
+          <n-button type="primary" :loading="rebalanceBusy" @click="doRebalance">确定</n-button>
+        </n-space>
       </n-space>
     </n-modal>
   </n-space>

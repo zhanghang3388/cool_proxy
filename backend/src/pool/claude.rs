@@ -83,6 +83,11 @@ impl ClaudePool {
         self.ids.read().unwrap().clone()
     }
 
+    /// 当前没绑代理的账号 id。
+    pub fn unassigned_ids(&self) -> Vec<String> {
+        store_claude::unassigned_ids(&self.db).unwrap_or_default()
+    }
+
     /// round-robin 选一个可用账号（账号级 cooldown / enabled 过滤）。
     pub fn pick(&self) -> Result<SelectedClaudeAccount, ClaudePoolError> {
         let now = Utc::now();

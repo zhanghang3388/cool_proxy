@@ -478,6 +478,10 @@ export async function getClaudeStats(): Promise<ClaudeStatsView> {
   const { data } = await http.get<ClaudeStatsView>('/claude/stats')
   return data
 }
+export async function rebalanceClaudeProxies(only_unassigned: boolean): Promise<RebalanceResult> {
+  const { data } = await http.post<RebalanceResult>('/claude/accounts/rebalance', { only_unassigned })
+  return data
+}
 export async function claudeLoginStart(): Promise<ClaudeLoginStartResp> {
   const { data } = await http.post<ClaudeLoginStartResp>('/claude/login/start')
   return data
