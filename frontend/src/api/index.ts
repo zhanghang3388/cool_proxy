@@ -277,6 +277,131 @@ export async function setAccountProxy(
   await http.put(`/accounts/${encodeURIComponent(id)}/proxy`, payload)
 }
 
+// ===== Kiro 账号池 =====
+
+export interface KiroUsageView {
+  plan_name: string | null
+  plan_tier: string | null
+  credits_total: number | null
+  credits_used: number | null
+  credits_remaining: number | null
+  bonus_total: number | null
+  bonus_used: number | null
+  bonus_remaining: number | null
+  usage_reset_at: string | null
+  bonus_expire_days: number | null
+  checked_at: string | null
+  error: string | null
+}
+
+export interface KiroAccountView {
+  id: string
+  email: string
+  user_id: string | null
+  login_provider: string | null
+  auth_method: string
+  enabled: boolean
+  expire_at: string | null
+  last_refresh_at: string | null
+  last_used_at: string | null
+  failure_count: number
+  cooldown_until: string | null
+  last_error: string | null
+  total_requests: number
+  total_failures: number
+  expired: boolean
+  proxy_url: string
+  proxy_id: string | null
+  status: string | null
+  status_reason: string | null
+  usage: KiroUsageView
+}
+
+export interface KiroAccountListResp {
+  total: number
+  items: KiroAccountView[]
+  limit: number
+  offset: number
+}
+
+export interface KiroQuotaRefreshItem {
+  id: string
+  ok: boolean
+  usage: KiroUsageView | null
+  error: string | null
+}
+
+export interface KiroQuotaRefreshResp {
+  items: KiroQuotaRefreshItem[]
+}
+
+export interface KiroStatsView {
+  total_accounts: number
+  enabled_accounts: number
+  cooling_down: number
+  expired: number
+  total_requests: number
+  total_failures: number
+}
+
+export async function listKiroAccounts(
+  params: { limit?: number; offset?: number; q?: string } = {},
+): Promise<KiroAccountListResp> {
+  const { data } = await http.get<KiroAccountListResp>('/kiro/accounts', { params })
+  return data
+}
+
+export async function uploadKiroAccounts(
+  files: File[],
+): Promise<{ imported: string[]; errors: string[] }> {
+  const fd = new FormData()
+  files.forEach((f) => fd.append('file', f, f.name))
+  const { data } = await http.post('/kiro/accounts', fd, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+  return data
+}
+
+export async function importKiroAccountsJson(
+  payload: { text?: string; token?: unknown; tokens?: unknown[] },
+): Promise<{ imported: string[]; errors: string[] }> {
+  const { data } = await http.post('/kiro/accounts/import', payload)
+  return data
+}
+
+export async function patchKiroAccount(id: string, payload: { enabled?: boolean }): Promise<void> {
+  await http.patch(`/kiro/accounts/${encodeURIComponent(id)}`, payload)
+}
+export async function deleteKiroAccount(id: string): Promise<void> {
+  await http.delete(`/kiro/accounts/${encodeURIComponent(id)}`)
+}
+export async function refreshKiroAccount(id: string): Promise<void> {
+  await http.post(`/kiro/accounts/${encodeURIComponent(id)}/refresh`)
+}
+export async function refreshKiroAccountQuota(id: string): Promise<KiroQuotaRefreshItem> {
+  const { data } = await http.post<KiroQuotaRefreshItem>(
+    `/kiro/accounts/${encodeURIComponent(id)}/quota`,
+  )
+  return data
+}
+export async function refreshKiroAccountQuotas(ids: string[]): Promise<KiroQuotaRefreshResp> {
+  const { data } = await http.post<KiroQuotaRefreshResp>('/kiro/accounts/quota/refresh', { ids })
+  return data
+}
+export async function resetKiroCooldown(id: string): Promise<void> {
+  await http.post(`/kiro/accounts/${encodeURIComponent(id)}/reset-cooldown`)
+}
+export async function setKiroAccountProxy(
+  id: string,
+  payload: { proxy_id?: string; url?: string },
+): Promise<void> {
+  await http.put(`/kiro/accounts/${encodeURIComponent(id)}/proxy`, payload)
+}
+export async function getKiroStats(): Promise<KiroStatsView> {
+  const { data } = await http.get<KiroStatsView>('/kiro/stats')
+  return data
+}
+
 export async function ping(): Promise<boolean> {
   try {
     await http.get('/stats')

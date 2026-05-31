@@ -8,6 +8,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod kiro_accounts;
 pub mod proxies;
 pub mod requests;
 
@@ -115,6 +116,58 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_requests_at ON requests(at DESC);
         CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
         CREATE INDEX IF NOT EXISTS idx_requests_account ON requests(account_id);
+
+        -- Kiro 账号池：和 codex accounts 平行的一张表。
+        CREATE TABLE IF NOT EXISTS kiro_accounts (
+            id              TEXT PRIMARY KEY,
+            email           TEXT NOT NULL DEFAULT '',
+            user_id         TEXT,
+            login_provider  TEXT,
+            auth_method     TEXT NOT NULL DEFAULT 'social',  -- social | idc
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            access_token    TEXT NOT NULL DEFAULT '',
+            refresh_token   TEXT NOT NULL DEFAULT '',
+            token_type      TEXT,
+            expires_at      INTEGER,           -- unix ms
+            -- IdC / Builder-ID 刷新所需
+            idc_region      TEXT,
+            issuer_url      TEXT,
+            client_id       TEXT,
+            client_secret   TEXT,
+            scopes          TEXT,
+            login_hint      TEXT,
+            profile_arn     TEXT,
+            -- 套餐 / 额度
+            plan_name       TEXT,
+            plan_tier       TEXT,
+            credits_total   REAL,
+            credits_used    REAL,
+            bonus_total     REAL,
+            bonus_used      REAL,
+            usage_reset_at  INTEGER,           -- unix ms
+            bonus_expire_days INTEGER,
+            -- 运行时状态
+            last_refresh_at INTEGER,
+            failure_count   INTEGER NOT NULL DEFAULT 0,
+            cooldown_until  INTEGER,
+            last_error      TEXT,
+            last_used_at    INTEGER,
+            total_requests  INTEGER NOT NULL DEFAULT 0,
+            total_failures  INTEGER NOT NULL DEFAULT 0,
+            proxy_url       TEXT NOT NULL DEFAULT '',
+            -- 封禁 / 额度查询状态
+            status          TEXT,
+            status_reason   TEXT,
+            quota_checked_at INTEGER,
+            quota_error     TEXT,
+            -- 原始快照，刷新 / 调试时保留
+            raw_auth_token  TEXT NOT NULL DEFAULT '{}',
+            raw_usage       TEXT NOT NULL DEFAULT '{}',
+            created_at      INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kiro_enabled ON kiro_accounts(enabled);
+        CREATE INDEX IF NOT EXISTS idx_kiro_email ON kiro_accounts(email);
+        CREATE INDEX IF NOT EXISTS idx_kiro_proxy ON kiro_accounts(proxy_url);
         ",
     )?;
     ensure_column(conn, "accounts", "quota_5h_used_percent", "REAL")?;

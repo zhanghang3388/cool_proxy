@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use crate::auth::kiro_refresh::KiroRefresher;
 use crate::auth::refresher::Refresher;
 use crate::config::Config;
+use crate::pool::kiro::KiroPool;
 use crate::pool::AccountPool;
 use crate::proxy::{ProxiedClients, RequestLog};
 use crate::proxy_pool::{legacy_pool_path, ProxyPool};
@@ -12,9 +14,11 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub db: SqlitePool,
     pub pool: Arc<AccountPool>,
+    pub kiro_pool: Arc<KiroPool>,
     pub proxy_pool: Arc<ProxyPool>,
     pub clients: Arc<ProxiedClients>,
     pub refresher: Arc<Refresher>,
+    pub kiro_refresher: Arc<KiroRefresher>,
     pub request_log: Arc<RequestLog>,
 }
 
@@ -26,20 +30,26 @@ impl AppState {
         let pool = Arc::new(AccountPool::new(config.clone(), db.clone()));
         pool.load_from_disk()?;
 
+        let kiro_pool = Arc::new(KiroPool::new(config.clone(), db.clone()));
+        kiro_pool.load()?;
+
         let proxy_pool = Arc::new(ProxyPool::new(db.clone()));
         proxy_pool.import_legacy_if_empty(&legacy_pool_path(&config.auth_dir))?;
 
         let clients = Arc::new(ProxiedClients::new());
         let refresher = Arc::new(Refresher::new(clients.clone()));
+        let kiro_refresher = Arc::new(KiroRefresher::new(clients.clone()));
         let request_log = Arc::new(RequestLog::new(db.clone()));
 
         Ok(Self {
             config,
             db,
             pool,
+            kiro_pool,
             proxy_pool,
             clients,
             refresher,
+            kiro_refresher,
             request_log,
         })
     }

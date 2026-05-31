@@ -17,6 +17,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::auth::kiro_refresh::run_kiro_refresh_loop;
 use crate::auth::refresher::run_refresh_loop;
 use crate::config::Config;
 use crate::state::AppState;
@@ -57,6 +58,14 @@ async fn main() -> anyhow::Result<()> {
         let p = state.pool.clone();
         let r = state.refresher.clone();
         tokio::spawn(run_refresh_loop(cfg, p, r));
+    }
+
+    // Kiro 后台 token 刷新
+    {
+        let cfg = config.clone();
+        let p = state.kiro_pool.clone();
+        let r = state.kiro_refresher.clone();
+        tokio::spawn(run_kiro_refresh_loop(cfg, p, r));
     }
 
     let cors = CorsLayer::new()

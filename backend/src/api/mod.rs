@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod auth;
+pub mod kiro_accounts;
 pub mod logs;
 pub mod proxies;
 pub mod stats;
@@ -42,6 +43,34 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/usage", get(usage::report))
         .route("/config", get(stats::current_config))
         .route("/logs", get(logs::list).delete(logs::clear))
+        // ===== Kiro 账号池 =====
+        .route(
+            "/kiro/accounts",
+            get(kiro_accounts::list).post(kiro_accounts::upload),
+        )
+        .route("/kiro/accounts/import", post(kiro_accounts::import_json))
+        .route(
+            "/kiro/accounts/quota/refresh",
+            post(kiro_accounts::refresh_quotas),
+        )
+        .route(
+            "/kiro/accounts/:id",
+            delete(kiro_accounts::delete_one).patch(kiro_accounts::patch_one),
+        )
+        .route(
+            "/kiro/accounts/:id/refresh",
+            post(kiro_accounts::manual_refresh),
+        )
+        .route(
+            "/kiro/accounts/:id/quota",
+            post(kiro_accounts::refresh_quota),
+        )
+        .route(
+            "/kiro/accounts/:id/reset-cooldown",
+            post(kiro_accounts::reset_cooldown),
+        )
+        .route("/kiro/accounts/:id/proxy", put(kiro_accounts::set_proxy))
+        .route("/kiro/stats", get(kiro_accounts::stats))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::admin_guard,
