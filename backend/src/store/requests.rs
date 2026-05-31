@@ -122,11 +122,7 @@ pub struct UsageReport {
     pub by_account: Vec<UsageBucket>,
 }
 
-pub fn usage(
-    pool: &SqlitePool,
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
-) -> Result<UsageReport> {
+pub fn usage(pool: &SqlitePool, from_ms: Option<i64>, to_ms: Option<i64>) -> Result<UsageReport> {
     let conn = pool.get()?;
     let from = from_ms.unwrap_or(0);
     let to = to_ms.unwrap_or(i64::MAX);
@@ -210,6 +206,10 @@ pub fn count(pool: &SqlitePool) -> Result<i64> {
 pub fn get(pool: &SqlitePool, id: i64) -> Result<Option<RequestRow>> {
     let conn = pool.get()?;
     Ok(conn
-        .query_row("SELECT * FROM requests WHERE id = ?1", params![id], row_to_request)
+        .query_row(
+            "SELECT * FROM requests WHERE id = ?1",
+            params![id],
+            row_to_request,
+        )
         .optional()?)
 }

@@ -19,10 +19,7 @@ pub struct UsageQuery {
     pub to_ms: Option<i64>,
 }
 
-pub async fn report(
-    State(app): State<Arc<AppState>>,
-    Query(q): Query<UsageQuery>,
-) -> Response {
+pub async fn report(State(app): State<Arc<AppState>>, Query(q): Query<UsageQuery>) -> Response {
     match store_requests::usage(&app.db, q.from_ms, q.to_ms) {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

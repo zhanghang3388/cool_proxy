@@ -63,8 +63,7 @@ impl Config {
     pub fn load(path: &PathBuf) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("read config file {:?}", path))?;
-        let cfg: Config =
-            serde_yaml::from_str(&content).with_context(|| "parse yaml config")?;
+        let cfg: Config = serde_yaml::from_str(&content).with_context(|| "parse yaml config")?;
         cfg.validate()?;
         Ok(cfg)
     }

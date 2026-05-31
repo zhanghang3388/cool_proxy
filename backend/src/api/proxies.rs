@@ -63,10 +63,7 @@ pub async fn update(
     Json(json!({"ok": true})).into_response()
 }
 
-pub async fn delete_one(
-    State(app): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn delete_one(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let url = app.proxy_pool.url_by_id(&id);
     match app.proxy_pool.remove(&id) {
         Ok(true) => {
@@ -175,10 +172,7 @@ struct IpApiResp {
     mobile: Option<bool>,
 }
 
-pub async fn test_one(
-    State(app): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn test_one(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let url = match app.proxy_pool.url_by_id(&id) {
         Some(u) => u,
         None => return (StatusCode::NOT_FOUND, "proxy not found").into_response(),
@@ -259,7 +253,10 @@ pub async fn test_one(
             purity_score: 0,
             purity_label: "不可用".into(),
             purity_reasons: vec![],
-            error: Some(format!("http {code}: {}", body.chars().take(200).collect::<String>())),
+            error: Some(format!(
+                "http {code}: {}",
+                body.chars().take(200).collect::<String>()
+            )),
         })
         .into_response();
     }
@@ -302,7 +299,9 @@ pub async fn test_one(
             purity_score: 0,
             purity_label: "不可用".into(),
             purity_reasons: vec![],
-            error: data.message.or_else(|| Some("ip-api returned non-success".into())),
+            error: data
+                .message
+                .or_else(|| Some("ip-api returned non-success".into())),
         })
         .into_response();
     }
@@ -366,11 +365,37 @@ fn score_purity(d: &IpApiResp, latency_ms: u128) -> (u8, String, Vec<String>) {
 
     // 常见机房 / 云厂商 / VPS 关键字
     const HOST_KW: &[&str] = &[
-        "amazon", "aws", "google", "gcp", "microsoft", "azure", "oracle",
-        "digitalocean", "linode", "vultr", "ovh", "hetzner", "leaseweb",
-        "choopa", "contabo", "datacamp", "m247", "psychz", "host", "hosting",
-        "server", "cloud", "idc", "data center", "datacenter", "colocation",
-        "tencent", "alibaba", "aliyun", "huawei cloud", "ucloud",
+        "amazon",
+        "aws",
+        "google",
+        "gcp",
+        "microsoft",
+        "azure",
+        "oracle",
+        "digitalocean",
+        "linode",
+        "vultr",
+        "ovh",
+        "hetzner",
+        "leaseweb",
+        "choopa",
+        "contabo",
+        "datacamp",
+        "m247",
+        "psychz",
+        "host",
+        "hosting",
+        "server",
+        "cloud",
+        "idc",
+        "data center",
+        "datacenter",
+        "colocation",
+        "tencent",
+        "alibaba",
+        "aliyun",
+        "huawei cloud",
+        "ucloud",
     ];
     let mut hit_host = false;
     for kw in HOST_KW {
@@ -386,11 +411,36 @@ fn score_purity(d: &IpApiResp, latency_ms: u128) -> (u8, String, Vec<String>) {
 
     // 住宅 ISP 关键字（加分）
     const RESI_KW: &[&str] = &[
-        "comcast", "verizon", "at&t", "att ", "spectrum", "charter", "cox",
-        "telecom", "telekom", "broadband", "cable", "fiber", "fttx", "fios",
-        "chinanet", "china unicom", "china telecom", "china mobile", "cmcc",
-        "softbank", "kddi", "ntt", "korea telecom", "kt corp", "lg uplus",
-        "bt ", "virgin media", "deutsche telekom", "vodafone", "orange",
+        "comcast",
+        "verizon",
+        "at&t",
+        "att ",
+        "spectrum",
+        "charter",
+        "cox",
+        "telecom",
+        "telekom",
+        "broadband",
+        "cable",
+        "fiber",
+        "fttx",
+        "fios",
+        "chinanet",
+        "china unicom",
+        "china telecom",
+        "china mobile",
+        "cmcc",
+        "softbank",
+        "kddi",
+        "ntt",
+        "korea telecom",
+        "kt corp",
+        "lg uplus",
+        "bt ",
+        "virgin media",
+        "deutsche telekom",
+        "vodafone",
+        "orange",
     ];
     for kw in RESI_KW {
         if blob.contains(kw) {

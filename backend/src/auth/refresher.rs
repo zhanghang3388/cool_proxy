@@ -78,11 +78,7 @@ impl Refresher {
 }
 
 /// 后台任务：周期扫号池，刷新即将过期的 token。直接写 DB（pool.update_after_refresh），不再落文件。
-pub async fn run_refresh_loop(
-    cfg: Arc<Config>,
-    pool: Arc<AccountPool>,
-    refresher: Arc<Refresher>,
-) {
+pub async fn run_refresh_loop(cfg: Arc<Config>, pool: Arc<AccountPool>, refresher: Arc<Refresher>) {
     let interval = Duration::from_secs(cfg.token_refresh.scan_interval_seconds.max(10));
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

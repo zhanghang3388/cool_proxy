@@ -156,8 +156,14 @@ mod tests {
     fn classify_with_body_other_codes_unchanged() {
         // body 不影响非 404 的分类
         assert_eq!(classify_with_body(Some(429), "anything"), ErrorKind::Quota);
-        assert_eq!(classify_with_body(Some(401), "model anything"), ErrorKind::Auth);
-        assert_eq!(classify_with_body(Some(500), "model not_supported"), ErrorKind::Transient);
+        assert_eq!(
+            classify_with_body(Some(401), "model anything"),
+            ErrorKind::Auth
+        );
+        assert_eq!(
+            classify_with_body(Some(500), "model not_supported"),
+            ErrorKind::Transient
+        );
         assert_eq!(classify_with_body(None, "anything"), ErrorKind::Network);
     }
 }

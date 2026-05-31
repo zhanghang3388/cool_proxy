@@ -9,11 +9,7 @@ use crate::state::AppState;
 
 /// 简单的 admin token 校验中间件。Header: `Authorization: Bearer <admin_token>`
 /// 或 `x-admin-token: <admin_token>`。
-pub async fn admin_guard(
-    State(app): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn admin_guard(State(app): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let token_opt = req
         .headers()
         .get("authorization")

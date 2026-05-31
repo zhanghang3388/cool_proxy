@@ -15,10 +15,7 @@ pub fn translate_request(model: &str, openai_body: &[u8], stream: bool) -> Value
     out.insert("model".into(), Value::String(model.to_string()));
     out.insert("instructions".into(), Value::String(String::new()));
     out.insert("stream".into(), Value::Bool(stream));
-    out.insert(
-        "include".into(),
-        json!(["reasoning.encrypted_content"]),
-    );
+    out.insert("include".into(), json!(["reasoning.encrypted_content"]));
     out.insert("parallel_tool_calls".into(), Value::Bool(true));
     out.insert("store".into(), Value::Bool(false));
 
@@ -153,11 +150,7 @@ pub fn translate_request(model: &str, openai_body: &[u8], stream: bool) -> Value
                 _ => {
                     let mut msg = Map::new();
                     msg.insert("type".into(), Value::String("message".into()));
-                    let mapped_role = if role == "system" {
-                        "developer"
-                    } else {
-                        role
-                    };
+                    let mapped_role = if role == "system" { "developer" } else { role };
                     msg.insert("role".into(), Value::String(mapped_role.to_string()));
 
                     let mut content_arr: Vec<Value> = Vec::new();

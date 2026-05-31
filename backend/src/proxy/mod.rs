@@ -88,10 +88,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// 主入口：把任意 /v1/* 请求转发到 chatgpt.com/backend-api/codex/<rest>
-pub async fn proxy_handler(
-    State(app): State<Arc<AppState>>,
-    req: Request,
-) -> Response {
+pub async fn proxy_handler(State(app): State<Arc<AppState>>, req: Request) -> Response {
     if !verify_client_key(req.headers(), &app.config.api_keys) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid api key").into_response();
     }
@@ -125,11 +122,7 @@ pub async fn proxy_handler(
     let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("read request body: {e}"),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, format!("read request body: {e}")).into_response();
         }
     };
 
@@ -333,10 +326,8 @@ pub async fn proxy_handler(
         }
     }
 
-    let (status, msg) = last_error.unwrap_or((
-        StatusCode::BAD_GATEWAY,
-        "all retries failed".to_string(),
-    ));
+    let (status, msg) =
+        last_error.unwrap_or((StatusCode::BAD_GATEWAY, "all retries failed".to_string()));
     info!("proxy giving up: {status} {msg}");
     app.request_log.push(
         &parts.method,
@@ -447,7 +438,10 @@ fn models_get_response(app: &AppState, id: &str) -> Response {
     let list = models_catalog::build_simple_list(&plan_refs);
     let exists = list["data"]
         .as_array()
-        .map(|arr| arr.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id)))
+        .map(|arr| {
+            arr.iter()
+                .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id))
+        })
         .unwrap_or(false);
     if exists {
         let body = serde_json::json!({
@@ -692,9 +686,9 @@ async fn forward_once(
         }
     }
 
-    let stream = upstream.bytes_stream().map(|res| {
-        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-    });
+    let stream = upstream
+        .bytes_stream()
+        .map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
 
     let body = Body::from_stream(stream);
     let mut resp = Response::builder()
@@ -741,10 +735,7 @@ fn sse_data_line(payload: &serde_json::Value) -> String {
 
 /// `/v1/chat/completions`：把 OpenAI ChatCompletion 形状的请求翻译成 codex `/responses`，
 /// 转发到上游，把 codex SSE 流反向翻译成 chat.completion.chunk 流（或聚合成非流式响应）。
-pub async fn chat_completions_handler(
-    State(app): State<Arc<AppState>>,
-    req: Request,
-) -> Response {
+pub async fn chat_completions_handler(State(app): State<Arc<AppState>>, req: Request) -> Response {
     if !verify_client_key(req.headers(), &app.config.api_keys) {
         return openai_error_response(StatusCode::UNAUTHORIZED, "missing or invalid api key");
     }
@@ -775,15 +766,9 @@ pub async fn chat_completions_handler(
         .unwrap_or("")
         .to_string();
     if model.is_empty() {
-        return openai_error_response(
-            StatusCode::BAD_REQUEST,
-            "missing required field: model",
-        );
+        return openai_error_response(StatusCode::BAD_REQUEST, "missing required field: model");
     }
-    let client_wants_stream = raw
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let client_wants_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // 翻译成 codex /responses 形状。cool_proxy 内部一律 stream=true 上游。
     let codex_body = translator::translate_request(&model, &body_bytes, true);
@@ -950,10 +935,8 @@ pub async fn chat_completions_handler(
         }
     }
 
-    let (status, msg) = last_error.unwrap_or((
-        StatusCode::BAD_GATEWAY,
-        "all retries failed".to_string(),
-    ));
+    let (status, msg) =
+        last_error.unwrap_or((StatusCode::BAD_GATEWAY, "all retries failed".to_string()));
     info!("chat: giving up: {status} {msg}");
     app.request_log.push(
         &parts.method,
@@ -1101,7 +1084,10 @@ fn stream_translate_response(
         .body(body)
         .expect("build sse response");
     let h = out.headers_mut();
-    h.insert("content-type", HeaderValue::from_static("text/event-stream"));
+    h.insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     h.insert("cache-control", HeaderValue::from_static("no-cache"));
     h.insert("connection", HeaderValue::from_static("keep-alive"));
     out
@@ -1129,7 +1115,9 @@ async fn aggregate_translate_response(
         match chunk {
             Ok(b) => {
                 if tail.len() + b.len() > 32 * 1024 {
-                    let drop = (tail.len() + b.len()).saturating_sub(32 * 1024).min(tail.len());
+                    let drop = (tail.len() + b.len())
+                        .saturating_sub(32 * 1024)
+                        .min(tail.len());
                     let _ = tail.split_to(drop);
                 }
                 if b.len() >= 32 * 1024 {

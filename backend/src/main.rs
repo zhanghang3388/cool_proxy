@@ -77,8 +77,8 @@ async fn main() -> anyhow::Result<()> {
     // /v1/* 反代（OpenAI 兼容）
     // 显式列出：chat_completions 走翻译层；responses / models 走老的反代/内置 handler；
     // 其他未识别的 /v1/* 走兜底 404。
-    // /backend-api/codex/* 是 codex CLI 默认拼路径的方式（base_url 不带 /v1，直接拼 /responses），
-    // 给它一个 alias 命中同一个 proxy_handler。
+    // /backend-api/codex/* 是 codex CLI 配 base=host/backend-api/codex 时拼出来的；
+    // 根路径 /responses 是 codex CLI 配 base=host 时直接拼出来的。两种都兼容。
     let proxy_router = Router::new()
         .route(
             "/v1/chat/completions",
@@ -88,12 +88,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/responses/*rest", any(proxy::proxy_handler))
         .route("/v1/models", any(proxy::proxy_handler))
         .route("/v1/models/*id", any(proxy::proxy_handler))
-        // codex CLI 兼容
+        // codex CLI 兼容（base_url 带或不带 /backend-api/codex 都行）
         .route("/backend-api/codex/responses", any(proxy::proxy_handler))
         .route(
             "/backend-api/codex/responses/*rest",
             any(proxy::proxy_handler),
         )
+        .route("/responses", any(proxy::proxy_handler))
+        .route("/responses/*rest", any(proxy::proxy_handler))
         // Kiro 反代（Anthropic Messages API，独立 /kiro 前缀，不与 codex 冲突）
         .route(
             "/kiro/v1/messages",
@@ -124,8 +126,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_logging(level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("cool_proxy={level},tower_http=info,axum=info")));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!("cool_proxy={level},tower_http=info,axum=info"))
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

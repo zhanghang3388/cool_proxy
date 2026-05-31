@@ -41,8 +41,8 @@ fn default_type() -> String {
 
 impl CodexTokenStorage {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read token file {:?}", path))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read token file {:?}", path))?;
         let storage: CodexTokenStorage =
             serde_json::from_str(&raw).with_context(|| format!("parse token file {:?}", path))?;
         Ok(storage)
@@ -55,8 +55,7 @@ impl CodexTokenStorage {
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(self)?;
         std::fs::write(&tmp, &data).with_context(|| format!("write tmp file {:?}", tmp))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {:?} -> {:?}", tmp, path))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename {:?} -> {:?}", tmp, path))?;
         Ok(())
     }
 
@@ -87,8 +86,7 @@ impl CodexTokenStorage {
 /// 扫描目录下所有 codex-*.json 文件
 pub fn scan_codex_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create auth dir {:?}", dir))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create auth dir {:?}", dir))?;
         return Ok(vec![]);
     }
     let mut out = Vec::new();

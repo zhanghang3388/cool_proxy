@@ -127,7 +127,8 @@ mod tests {
 
     #[test]
     fn short_name_preserves_mcp_last_segment() {
-        let name = "mcp__some_very_long_server_with_extra_stuff__that_keeps_going_and_going__do_thing";
+        let name =
+            "mcp__some_very_long_server_with_extra_stuff__that_keeps_going_and_going__do_thing";
         assert!(name.len() > 64);
         let s = shorten_name_if_needed(name);
         assert!(s.starts_with("mcp__do_thing"), "got {s:?}");

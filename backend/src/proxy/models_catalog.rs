@@ -6,8 +6,7 @@ use serde_json::{json, Map, Value};
 /// codex 上游每个 plan 能用的 model 列表，从 CLIProxyAPI 同步过来
 /// (`internal/registry/models/models.json` 中的 `codex-free` / `codex-team` /
 /// `codex-plus` / `codex-pro` 四个段落)。编译时直接嵌进二进制；启动 / 运行期都不读文件。
-const CODEX_PLAN_MODELS_JSON: &str =
-    include_str!("./assets/codex_plan_models.json");
+const CODEX_PLAN_MODELS_JSON: &str = include_str!("./assets/codex_plan_models.json");
 
 #[derive(Debug, Clone)]
 pub struct PlanCatalog {
@@ -24,10 +23,8 @@ fn catalog() -> &'static PlanCatalog {
         if let Some(obj) = parsed.as_object() {
             for (plan_key, list) in obj {
                 if let Some(arr) = list.as_array() {
-                    let v: Vec<Map<String, Value>> = arr
-                        .iter()
-                        .filter_map(|x| x.as_object().cloned())
-                        .collect();
+                    let v: Vec<Map<String, Value>> =
+                        arr.iter().filter_map(|x| x.as_object().cloned()).collect();
                     by_plan.insert(plan_key.clone(), v);
                 }
             }
@@ -95,7 +92,10 @@ pub fn build_simple_list(plans: &[&str]) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("openai")
                 .to_string();
-            let created = m.get("created").and_then(|v| v.as_i64()).unwrap_or(1_700_000_000);
+            let created = m
+                .get("created")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1_700_000_000);
             json!({
                 "id": id,
                 "object": "model",
@@ -211,7 +211,9 @@ mod tests {
         assert!(!arr.is_empty());
         // catalog 里的条目带 display_name + context_length（来自 models.json 的 codex 段）
         let first = &arr[0];
-        assert!(first["display_name"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(first["display_name"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
         assert!(first["context_length"].is_number());
     }
 }

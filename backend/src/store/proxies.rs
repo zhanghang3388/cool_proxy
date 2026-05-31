@@ -80,10 +80,7 @@ pub fn update(
 ) -> Result<()> {
     let conn = pool.get()?;
     if let Some(u) = url {
-        conn.execute(
-            "UPDATE proxies SET url = ?2 WHERE id = ?1",
-            params![id, u],
-        )?;
+        conn.execute("UPDATE proxies SET url = ?2 WHERE id = ?1", params![id, u])?;
     }
     if let Some(l) = label {
         conn.execute(

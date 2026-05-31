@@ -120,9 +120,7 @@ impl StreamTranslator {
             }
             "response.output_item.added" => {
                 let item = codex_event.get("item");
-                let is_fc = item
-                    .and_then(|i| i.get("type"))
-                    .and_then(|t| t.as_str())
+                let is_fc = item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                     == Some("function_call");
                 if !is_fc {
                     return Vec::new();

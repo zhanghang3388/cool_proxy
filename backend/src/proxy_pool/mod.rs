@@ -132,8 +132,8 @@ pub fn validate_proxy_url(url: &str) -> Result<String> {
         trimmed = &trimmed[..idx];
     }
     let trimmed = trimmed.trim_end();
-    let parsed = reqwest::Url::parse(trimmed)
-        .with_context(|| format!("invalid proxy url: {trimmed}"))?;
+    let parsed =
+        reqwest::Url::parse(trimmed).with_context(|| format!("invalid proxy url: {trimmed}"))?;
     match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
         other => anyhow::bail!(
