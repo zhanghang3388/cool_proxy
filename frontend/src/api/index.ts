@@ -108,6 +108,13 @@ export interface LogEntry {
   error: string | null
 }
 
+export interface LogsResp {
+  total: number
+  items: LogEntry[]
+  limit: number
+  offset: number
+}
+
 export interface UsageBucket {
   key: string
   count: number
@@ -233,9 +240,9 @@ export async function getRuntimeConfig(): Promise<Record<string, unknown>> {
 }
 
 export async function listLogs(
-  params: { limit?: number; before_id?: number } = {},
-): Promise<LogEntry[]> {
-  const { data } = await http.get<LogEntry[]>('/logs', { params })
+  params: { limit?: number; offset?: number } = {},
+): Promise<LogsResp> {
+  const { data } = await http.get<LogsResp>('/logs', { params })
   return data
 }
 

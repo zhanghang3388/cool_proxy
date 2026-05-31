@@ -4,7 +4,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::proxy::LogEntry;
@@ -14,20 +14,33 @@ use crate::state::AppState;
 pub struct LogsQuery {
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// 加载更多：传上一页最小 id，返回 id < before_id 的记录
     #[serde(default)]
-    pub before_id: Option<i64>,
+    pub offset: usize,
 }
 
 fn default_limit() -> usize {
-    100
+    50
 }
 
-pub async fn list(
-    State(app): State<Arc<AppState>>,
-    Query(q): Query<LogsQuery>,
-) -> Json<Vec<LogEntry>> {
-    Json(app.request_log.snapshot(q.limit.clamp(1, 1000), q.before_id))
+#[derive(Serialize)]
+pub struct LogsResp {
+    pub total: i64,
+    pub items: Vec<LogEntry>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+pub async fn list(State(app): State<Arc<AppState>>, Query(q): Query<LogsQuery>) -> Json<LogsResp> {
+    let limit = q.limit.clamp(1, 1000);
+    let offset = q.offset;
+    let items = app.request_log.snapshot(limit, offset);
+    let total = app.request_log.count();
+    Json(LogsResp {
+        total,
+        items,
+        limit,
+        offset,
+    })
 }
 
 pub async fn clear(State(app): State<Arc<AppState>>) -> Response {

@@ -50,8 +50,13 @@ impl RequestLog {
         }
     }
 
-    pub fn snapshot(&self, limit: usize, before_id: Option<i64>) -> Vec<LogEntry> {
-        store_requests::list_recent(&self.db, limit as i64, before_id).unwrap_or_default()
+    /// 倒序分页快照。limit + offset。
+    pub fn snapshot(&self, limit: usize, offset: usize) -> Vec<LogEntry> {
+        store_requests::list_page(&self.db, limit as i64, offset as i64).unwrap_or_default()
+    }
+
+    pub fn count(&self) -> i64 {
+        store_requests::count(&self.db).unwrap_or(0)
     }
 
     pub fn clear(&self) {

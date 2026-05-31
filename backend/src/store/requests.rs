@@ -82,26 +82,13 @@ fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRow> {
     })
 }
 
-/// 倒序拿最近 limit 条；before_id 用于"加载更多"分页（< before_id）。
-pub fn list_recent(
-    pool: &SqlitePool,
-    limit: i64,
-    before_id: Option<i64>,
-) -> Result<Vec<RequestRow>> {
+/// 倒序分页：按 id DESC，limit + offset。
+pub fn list_page(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec<RequestRow>> {
     let conn = pool.get()?;
     let mut rows = Vec::new();
-    if let Some(bid) = before_id {
-        let mut stmt = conn.prepare(
-            "SELECT * FROM requests WHERE id < ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
-        for r in stmt.query_map(params![bid, limit], row_to_request)? {
-            rows.push(r?);
-        }
-    } else {
-        let mut stmt = conn.prepare("SELECT * FROM requests ORDER BY id DESC LIMIT ?1")?;
-        for r in stmt.query_map(params![limit], row_to_request)? {
-            rows.push(r?);
-        }
+    let mut stmt = conn.prepare("SELECT * FROM requests ORDER BY id DESC LIMIT ?1 OFFSET ?2")?;
+    for r in stmt.query_map(params![limit, offset], row_to_request)? {
+        rows.push(r?);
     }
     Ok(rows)
 }
@@ -214,7 +201,6 @@ pub fn usage(
     })
 }
 
-#[allow(dead_code)]
 pub fn count(pool: &SqlitePool) -> Result<i64> {
     let conn = pool.get()?;
     Ok(conn.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?)

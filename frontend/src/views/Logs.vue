@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  NCard, NDataTable, NSpace, NButton, NTag, NSwitch, NPopconfirm, useMessage,
+  NCard, NDataTable, NSpace, NButton, NTag, NSwitch, NPopconfirm, NPagination, useMessage,
   type DataTableColumns,
 } from 'naive-ui'
 import { LogEntry, listLogs, clearLogs } from '../api'
@@ -11,13 +11,22 @@ const auto = ref(true)
 const message = useMessage()
 let timer: number | null = null
 
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
+
 async function refresh() {
   try {
-    logs.value = await listLogs({ limit: 200 })
+    const offset = (page.value - 1) * pageSize.value
+    const res = await listLogs({ limit: pageSize.value, offset })
+    logs.value = res.items
+    total.value = res.total
   } catch (e) {
     message.error((e as Error).message)
   }
 }
+
+watch([page, pageSize], refresh)
 
 onMounted(async () => {
   await refresh()
@@ -107,6 +116,7 @@ const columns = computed<DataTableColumns<LogEntry>>(() => [
 async function doClear() {
   try {
     await clearLogs()
+    page.value = 1
     await refresh()
     message.success('已清空')
   } catch (e) {
@@ -138,5 +148,15 @@ async function doClear() {
       size="small"
       :bordered="false"
     />
+    <div style="margin-top: 12px; display: flex; justify-content: flex-end">
+      <n-pagination
+        v-model:page="page"
+        v-model:page-size="pageSize"
+        :item-count="total"
+        :page-sizes="[20, 50, 100, 200]"
+        show-size-picker
+        show-quick-jumper
+      />
+    </div>
   </n-card>
 </template>
