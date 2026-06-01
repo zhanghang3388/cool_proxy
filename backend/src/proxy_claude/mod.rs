@@ -4,8 +4,8 @@
 
 pub mod cloak;
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -24,6 +24,12 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA: &str =
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
 const CLAUDE_USER_AGENT: &str = "claude-cli/2.0.1 (external, cli)";
+/// 列模型时只带 OAuth beta（其余 messages 专用 beta 不发，降低被上游 400 的概率）。
+const ANTHROPIC_BETA_OAUTH: &str = "oauth-2025-04-20";
+
+/// 模型列表动态拉取的缓存 TTL：成功结果缓存 6 小时；失败后 5 分钟内不再打上游。
+const MODELS_POS_TTL: Duration = Duration::from_secs(6 * 3600);
+const MODELS_NEG_TTL: Duration = Duration::from_secs(300);
 
 /// Anthropic 风格错误体。
 fn anthropic_error(status: StatusCode, message: &str) -> Response {
@@ -37,20 +43,19 @@ fn anthropic_error(status: StatusCode, message: &str) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-/// `GET /claude/v1/models`：返回常见 Claude 模型列表。
-pub async fn models_handler(State(app): State<Arc<AppState>>, req: Request) -> Response {
-    if !verify_client_key(req.headers(), &app.config.api_keys) {
-        return anthropic_error(StatusCode::UNAUTHORIZED, "missing or invalid api key");
-    }
+/// 静态兜底模型清单：动态拉取失败 / 无可用账号时返回。
+const FALLBACK_MODEL_IDS: &[&str] = &[
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+    "claude-opus-4-1",
+    "claude-sonnet-4-0",
+    "claude-3-5-haiku-latest",
+];
+
+/// 把模型 id 列表包成 Anthropic `/v1/models` 风格响应体。
+fn models_payload(ids: &[String]) -> Value {
     let now = 1_700_000_000u64;
-    let ids = [
-        "claude-opus-4-5",
-        "claude-sonnet-4-5",
-        "claude-haiku-4-5",
-        "claude-opus-4-1",
-        "claude-sonnet-4-0",
-        "claude-3-5-haiku-latest",
-    ];
     let data: Vec<Value> = ids
         .iter()
         .map(|id| {
@@ -64,7 +69,143 @@ pub async fn models_handler(State(app): State<Arc<AppState>>, req: Request) -> R
             })
         })
         .collect();
-    axum::Json(json!({"object": "list", "data": data})).into_response()
+    json!({"object": "list", "data": data})
+}
+
+/// 模型列表缓存：动态拉取成功缓存 6h，失败缓存 5min（期间走兜底、不再打上游）。
+#[derive(Default)]
+pub struct ModelsCache {
+    inner: RwLock<Option<(Instant, Vec<String>)>>,
+}
+
+impl ModelsCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 取未过期缓存（命中返回 id 列表）。
+    fn get(&self) -> Option<Vec<String>> {
+        let g = self.inner.read().unwrap();
+        let (at, ids) = g.as_ref()?;
+        // 空列表代表“上游拉取失败”的负缓存：用更短的 TTL。
+        let ttl = if ids.is_empty() {
+            MODELS_NEG_TTL
+        } else {
+            MODELS_POS_TTL
+        };
+        if at.elapsed() < ttl {
+            Some(ids.clone())
+        } else {
+            None
+        }
+    }
+
+    fn put(&self, ids: Vec<String>) {
+        *self.inner.write().unwrap() = Some((Instant::now(), ids));
+    }
+}
+
+/// `GET /claude/v1/models`：用账号池里的 OAuth 令牌实时向 `api.anthropic.com/v1/models`
+/// 拉取该账号可见的模型；带缓存与静态兜底，拉取失败不影响接口可用。
+pub async fn models_handler(State(app): State<Arc<AppState>>, req: Request) -> Response {
+    if !verify_client_key(req.headers(), &app.config.api_keys) {
+        return anthropic_error(StatusCode::UNAUTHORIZED, "missing or invalid api key");
+    }
+
+    // 1) 缓存命中：正缓存直接返回；负缓存（空）走兜底。
+    if let Some(ids) = app.claude_models_cache.get() {
+        if ids.is_empty() {
+            return axum::Json(models_payload(&fallback_ids())).into_response();
+        }
+        return axum::Json(models_payload(&ids)).into_response();
+    }
+
+    // 2) 选个账号，实时拉取。无账号 / 全不可用：返回兜底，但不写负缓存（账号随时可能加进来）。
+    let selected = match app.claude_pool.pick() {
+        Ok(s) => s,
+        Err(_) => return axum::Json(models_payload(&fallback_ids())).into_response(),
+    };
+
+    match fetch_upstream_models(&app.clients, &selected.proxy_url, &selected.access_token).await {
+        Ok(ids) if !ids.is_empty() => {
+            app.claude_pool.report_success_for(&selected.id);
+            app.claude_models_cache.put(ids.clone());
+            axum::Json(models_payload(&ids)).into_response()
+        }
+        Ok(_) => {
+            // 上游返回空列表：当作失败处理，写负缓存避免反复打。
+            warn!(account = %selected.id, "claude /v1/models returned empty list, using fallback");
+            app.claude_models_cache.put(Vec::new());
+            axum::Json(models_payload(&fallback_ids())).into_response()
+        }
+        Err(e) => {
+            warn!(account = %selected.id, "claude /v1/models fetch failed: {e:#}; using fallback");
+            app.claude_models_cache.put(Vec::new());
+            axum::Json(models_payload(&fallback_ids())).into_response()
+        }
+    }
+}
+
+fn fallback_ids() -> Vec<String> {
+    FALLBACK_MODEL_IDS.iter().map(|s| s.to_string()).collect()
+}
+
+/// 向 `api.anthropic.com/v1/models` 拉一页模型，抽出全部 `data[].id`。
+/// 自动翻页（最多 5 页），失败 / 非 2xx 返回 Err。
+async fn fetch_upstream_models(
+    clients: &crate::proxy::ProxiedClients,
+    proxy_url: &str,
+    access_token: &str,
+) -> anyhow::Result<Vec<String>> {
+    let http = clients.get(proxy_url)?;
+    let mut ids: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+
+    for _ in 0..5 {
+        let mut url = format!("{UPSTREAM_BASE}/v1/models?limit=100");
+        if let Some(cursor) = &after {
+            url.push_str("&after_id=");
+            url.push_str(cursor);
+        }
+        let resp = http
+            .get(&url)
+            .timeout(Duration::from_secs(30))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-beta", ANTHROPIC_BETA_OAUTH)
+            .header("x-app", "cli")
+            .header("User-Agent", CLAUDE_USER_AGENT)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "upstream {} {}",
+                status.as_u16(),
+                body.chars().take(200).collect::<String>()
+            );
+        }
+        let v: Value = serde_json::from_str(&body)?;
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            for m in arr {
+                if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        let has_more = v.get("has_more").and_then(|x| x.as_bool()).unwrap_or(false);
+        let last_id = v
+            .get("last_id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        match (has_more, last_id) {
+            (true, Some(cursor)) => after = Some(cursor),
+            _ => break,
+        }
+    }
+    Ok(ids)
 }
 
 /// `POST /claude/v1/messages`：Anthropic Messages 反代主入口。

@@ -25,6 +25,7 @@ pub struct AppState {
     pub kiro_refresher: Arc<KiroRefresher>,
     pub claude_refresher: Arc<ClaudeRefresher>,
     pub claude_login: Arc<ClaudeLoginStore>,
+    pub claude_models_cache: Arc<crate::proxy_claude::ModelsCache>,
     pub request_log: Arc<RequestLog>,
 }
 
@@ -50,6 +51,7 @@ impl AppState {
         let kiro_refresher = Arc::new(KiroRefresher::new(clients.clone()));
         let claude_refresher = Arc::new(ClaudeRefresher::new(clients.clone()));
         let claude_login = Arc::new(ClaudeLoginStore::new());
+        let claude_models_cache = Arc::new(crate::proxy_claude::ModelsCache::new());
         let request_log = Arc::new(RequestLog::new(db.clone()));
 
         Ok(Self {
@@ -64,6 +66,7 @@ impl AppState {
             kiro_refresher,
             claude_refresher,
             claude_login,
+            claude_models_cache,
             request_log,
         })
     }
