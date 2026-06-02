@@ -1,16 +1,16 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  NCard, NDataTable, NSpace, NButton, NTag, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
-  NSelect, NInput, NPagination, NModal, NAlert, NCheckbox,
+  NCard, NSpace, NButton, NTag, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
+  NSelect, NInput, NPagination, NModal, NAlert, NCheckbox, NProgress, NEmpty, NSpin,
   useMessage,
-  type DataTableColumns,
 } from 'naive-ui'
 import {
-  ClaudeAccountView, ClaudeStatsView, ProxyEntry,
+  ClaudeAccountView, ClaudeStatsView, ProxyEntry, QuotaWindowView,
   listClaudeAccounts, deleteClaudeAccount, refreshClaudeAccount, resetClaudeCooldown,
   patchClaudeAccount, getClaudeStats, listProxies, setClaudeAccountProxy,
   claudeLoginStart, claudeLoginFinish, rebalanceClaudeProxies,
+  refreshClaudeAccountQuota, refreshClaudeAccountQuotas,
 } from '../api'
 
 const accounts = ref<ClaudeAccountView[]>([])
@@ -23,6 +23,10 @@ const page = ref(1)
 const pageSize = ref(50)
 const total = ref(0)
 const search = ref('')
+
+// 额度查询是手动触发的，按账号记 loading；整页轮询只拉列表（含已缓存额度），不打额度端点。
+const quotaLoading = ref<Record<string, boolean>>({})
+const bulkQuotaLoading = ref(false)
 
 let timer: number | null = null
 let searchTimer: number | null = null
@@ -74,6 +78,11 @@ function fmtTime(s: string | null): string {
   }
 }
 
+function fmtPercent(n: number | null | undefined): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return '-'
+  return `${Math.round(n)}%`
+}
+
 const proxyOptions = computed(() => [
   { label: '直连', value: '__direct__' },
   ...proxies.value.map((p) => ({
@@ -82,127 +91,68 @@ const proxyOptions = computed(() => [
   })),
 ])
 
-const columns = computed<DataTableColumns<ClaudeAccountView>>(() => [
-  { title: '邮箱', key: 'email', minWidth: 200, ellipsis: { tooltip: true } },
-  {
-    title: '组织',
-    key: 'org_name',
-    width: 140,
-    ellipsis: { tooltip: true },
-    render: (row) => row.org_name ?? '-',
-  },
-  {
-    title: '状态',
-    key: 'status',
-    width: 110,
-    render: (row) => {
-      if (!row.enabled) {
-        return h(NTag, { type: 'default', size: 'small' }, { default: () => '禁用' })
-      }
-      if (row.cooldown_until && new Date(row.cooldown_until) > new Date()) {
-        return h(NTag, { type: 'warning', size: 'small' }, { default: () => '冷却中' })
-      }
-      if (row.expired) {
-        return h(NTag, { type: 'error', size: 'small' }, { default: () => '已过期' })
-      }
-      return h(NTag, { type: 'success', size: 'small' }, { default: () => '可用' })
-    },
-  },
-  {
-    title: '到期时间',
-    key: 'expire_at',
-    width: 170,
-    render: (row) => fmtTime(row.expire_at),
-  },
-  {
-    title: '代理',
-    key: 'proxy',
-    width: 220,
-    render: (row) => {
-      const opts = [...proxyOptions.value]
-      const known = !row.proxy_url || row.proxy_id !== null
-      if (!known) {
-        opts.push({ label: `自定义 (${row.proxy_url})`, value: '__custom__' })
-      }
-      const value = !row.proxy_url ? '__direct__' : row.proxy_id ?? '__custom__'
-      return h(NSelect, {
-        value,
-        options: opts,
-        size: 'small',
-        consistentMenuWidth: false,
-        'onUpdate:value': async (v: string) => {
-          if (v === '__custom__') return
-          try {
-            await setClaudeAccountProxy(row.id, { proxy_id: v === '__direct__' ? '' : v })
-            message.success('已更新代理')
-            await refresh()
-          } catch (e) {
-            message.error((e as Error).message)
-          }
-        },
-      })
-    },
-  },
-  {
-    title: '最近刷新',
-    key: 'last_refresh_at',
-    width: 170,
-    render: (row) => fmtTime(row.last_refresh_at),
-  },
-  {
-    title: '请求 / 失败',
-    key: 'reqfail',
-    width: 110,
-    render: (row) => `${row.total_requests} / ${row.total_failures}`,
-  },
-  {
-    title: '最近错误',
-    key: 'last_error',
-    minWidth: 200,
-    ellipsis: { tooltip: true },
-    render: (row) => row.last_error ?? '-',
-  },
-  {
-    title: '启用',
-    key: 'enabled',
-    width: 80,
-    render: (row) =>
-      h(NSwitch, {
-        value: row.enabled,
-        size: 'small',
-        'onUpdate:value': async (v: boolean) => {
-          try {
-            await patchClaudeAccount(row.id, { enabled: v })
-            row.enabled = v
-            message.success(v ? '已启用' : '已禁用')
-          } catch (e) {
-            message.error(`操作失败：${(e as Error).message}`)
-          }
-        },
-      }),
-  },
-  {
-    title: '操作',
-    key: 'actions',
-    width: 230,
-    render: (row) =>
-      h(NSpace, { size: 4 }, {
-        default: () => [
-          h(NButton, { size: 'small', onClick: () => doRefresh(row.id) }, { default: () => '刷新 token' }),
-          h(NButton, { size: 'small', onClick: () => doResetCooldown(row.id) }, { default: () => '清除冷却' }),
-          h(
-            NPopconfirm,
-            { onPositiveClick: () => doDelete(row.id) },
-            {
-              default: () => '确定删除该账号？',
-              trigger: () =>
-                h(NButton, { size: 'small', type: 'error', ghost: true }, { default: () => '删除' }),
-            },
-          ),
-        ],
-      }),
-  },
-])
+// ===== 状态标签 =====
+type StatusInfo = { type: 'success' | 'warning' | 'error' | 'default'; label: string }
+function statusOf(row: ClaudeAccountView): StatusInfo {
+  if (!row.enabled) return { type: 'default', label: '禁用' }
+  if (row.cooldown_until && new Date(row.cooldown_until) > new Date()) {
+    return { type: 'warning', label: '冷却中' }
+  }
+  if (row.expired) return { type: 'error', label: '已过期' }
+  return { type: 'success', label: '可用' }
+}
+
+// ===== 额度 =====
+function windowRemaining(w: QuotaWindowView | null): number | null {
+  return w?.remaining_percent ?? null
+}
+function quotaBarStatus(remaining: number | null): 'default' | 'error' | 'warning' | 'success' {
+  if (remaining === null) return 'default'
+  if (remaining <= 15) return 'error'
+  if (remaining <= 35) return 'warning'
+  return 'success'
+}
+function quotaResetTitle(w: QuotaWindowView | null, label: string): string {
+  const remaining = windowRemaining(w)
+  const reset = w?.reset_at ? `，重置：${fmtTime(w.reset_at)}` : ''
+  return `${label} 剩余 ${fmtPercent(remaining)}${reset}`
+}
+function hasQuota(row: ClaudeAccountView): boolean {
+  return !!(row.quota?.five_hour || row.quota?.week)
+}
+
+function proxySelectValue(row: ClaudeAccountView): string {
+  if (!row.proxy_url) return '__direct__'
+  return row.proxy_id ?? '__custom__'
+}
+function proxySelectOptions(row: ClaudeAccountView) {
+  const opts = [...proxyOptions.value]
+  const known = !row.proxy_url || row.proxy_id !== null
+  if (!known) opts.push({ label: `自定义 (${row.proxy_url})`, value: '__custom__' })
+  return opts
+}
+
+// ===== 操作 =====
+async function onToggleEnabled(row: ClaudeAccountView, v: boolean) {
+  try {
+    await patchClaudeAccount(row.id, { enabled: v })
+    row.enabled = v
+    message.success(v ? '已启用' : '已禁用')
+  } catch (e) {
+    message.error(`操作失败：${(e as Error).message}`)
+  }
+}
+
+async function onProxyChange(row: ClaudeAccountView, v: string) {
+  if (v === '__custom__') return
+  try {
+    await setClaudeAccountProxy(row.id, { proxy_id: v === '__direct__' ? '' : v })
+    message.success('已更新代理')
+    await refresh()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
 
 async function doRefresh(id: string) {
   try {
@@ -232,6 +182,44 @@ async function doDelete(id: string) {
     await refresh()
   } catch (e) {
     message.error((e as Error).message)
+  }
+}
+
+function applyQuota(id: string, quota: ClaudeAccountView['quota']) {
+  const acc = accounts.value.find((a) => a.id === id)
+  if (acc) acc.quota = quota
+}
+
+async function doQuota(id: string) {
+  quotaLoading.value[id] = true
+  try {
+    const item = await refreshClaudeAccountQuota(id)
+    if (item.quota) applyQuota(id, item.quota)
+    if (item.ok) message.success('额度已更新')
+    else message.warning(`查询失败：${item.error ?? '未知错误'}`)
+  } catch (e) {
+    const err = e as { response?: { data?: string }; message: string }
+    message.error(`查额度失败：${err.response?.data || err.message}`)
+  } finally {
+    quotaLoading.value[id] = false
+  }
+}
+
+async function doQuotaAll() {
+  bulkQuotaLoading.value = true
+  try {
+    const ids = accounts.value.map((a) => a.id)
+    const resp = await refreshClaudeAccountQuotas(ids)
+    for (const item of resp.items) {
+      if (item.quota) applyQuota(item.id, item.quota)
+    }
+    const okCount = resp.items.filter((i) => i.ok).length
+    const failCount = resp.items.length - okCount
+    message.success(`额度刷新完成：成功 ${okCount}` + (failCount ? `，失败 ${failCount}` : ''))
+  } catch (e) {
+    message.error(`批量查额度失败：${(e as Error).message}`)
+  } finally {
+    bulkQuotaLoading.value = false
   }
 }
 
@@ -298,7 +286,7 @@ async function copyAuthUrl() {
   }
 }
 
-// ===== 重新分配代理（与 codex 一致：从共享代理池 round-robin，可复用）=====
+// ===== 重新分配代理 =====
 const showRebalance = ref(false)
 const onlyUnassigned = ref(true)
 const rebalanceBusy = ref(false)
@@ -339,22 +327,121 @@ async function doRebalance() {
             v-model:value="search"
             placeholder="按邮箱 / id 搜索"
             clearable
-            style="width: 240px"
+            style="width: 220px"
             size="small"
           />
           <n-button type="primary" @click="openLogin">添加账号（OAuth 登录）</n-button>
+          <n-button :loading="bulkQuotaLoading" @click="doQuotaAll">刷新全部额度</n-button>
           <n-button @click="showRebalance = true">重新分配代理</n-button>
           <n-button @click="refresh" :loading="loading">手动刷新</n-button>
         </n-space>
       </template>
-      <n-data-table
-        :columns="columns"
-        :data="accounts"
-        :bordered="false"
-        :row-key="(row: ClaudeAccountView) => row.id"
-        :scroll-x="1600"
-        size="small"
-      />
+
+      <n-spin :show="loading">
+        <n-empty v-if="!accounts.length" description="暂无账号，点击右上角「添加账号」登录" style="padding: 40px 0" />
+
+        <n-grid v-else responsive="screen" cols="1 s:1 m:2 l:3 xl:3" :x-gap="12" :y-gap="12">
+          <n-gi v-for="row in accounts" :key="row.id">
+            <n-card size="small" :bordered="true" class="acc-card">
+              <!-- 头部：邮箱 + 状态 + 启用开关 -->
+              <div class="acc-head">
+                <div class="acc-title" :title="row.email">
+                  <span class="acc-email">{{ row.email || row.id }}</span>
+                  <n-tag :type="statusOf(row).type" size="small" round>{{ statusOf(row).label }}</n-tag>
+                </div>
+                <n-switch
+                  :value="row.enabled"
+                  size="small"
+                  @update:value="(v: boolean) => onToggleEnabled(row, v)"
+                />
+              </div>
+              <div class="acc-org" v-if="row.org_name">{{ row.org_name }}</div>
+
+              <!-- 额度块 -->
+              <div class="quota-box">
+                <template v-if="row.quota?.error">
+                  <n-space :size="6" align="center">
+                    <n-tag type="error" size="small" :title="row.quota.error">额度查询失败</n-tag>
+                    <span class="muted" v-if="row.quota.checked_at">{{ fmtTime(row.quota.checked_at) }}</span>
+                  </n-space>
+                </template>
+                <template v-else-if="!hasQuota(row)">
+                  <n-tag size="small">额度未查询</n-tag>
+                </template>
+                <template v-else>
+                  <div class="quota-line" :title="quotaResetTitle(row.quota.five_hour, '5 小时')">
+                    <span class="quota-label">5 小时</span>
+                    <n-progress
+                      type="line"
+                      :percentage="Math.round(windowRemaining(row.quota.five_hour) ?? 0)"
+                      :height="8"
+                      :border-radius="2"
+                      :fill-border-radius="2"
+                      :show-indicator="false"
+                      :status="quotaBarStatus(windowRemaining(row.quota.five_hour))"
+                    />
+                    <span class="quota-percent">{{ fmtPercent(windowRemaining(row.quota.five_hour)) }}</span>
+                  </div>
+                  <div class="quota-line" :title="quotaResetTitle(row.quota.week, '7 天')">
+                    <span class="quota-label">7 天</span>
+                    <n-progress
+                      type="line"
+                      :percentage="Math.round(windowRemaining(row.quota.week) ?? 0)"
+                      :height="8"
+                      :border-radius="2"
+                      :fill-border-radius="2"
+                      :show-indicator="false"
+                      :status="quotaBarStatus(windowRemaining(row.quota.week))"
+                    />
+                    <span class="quota-percent">{{ fmtPercent(windowRemaining(row.quota.week)) }}</span>
+                  </div>
+                  <div class="muted quota-checked" v-if="row.quota.checked_at">
+                    查询于 {{ fmtTime(row.quota.checked_at) }}
+                  </div>
+                </template>
+              </div>
+
+              <!-- 元信息 -->
+              <div class="meta-grid">
+                <div class="meta-item"><span class="meta-k">到期</span><span class="meta-v">{{ fmtTime(row.expire_at) }}</span></div>
+                <div class="meta-item"><span class="meta-k">最近刷新</span><span class="meta-v">{{ fmtTime(row.last_refresh_at) }}</span></div>
+                <div class="meta-item"><span class="meta-k">请求 / 失败</span><span class="meta-v">{{ row.total_requests }} / {{ row.total_failures }}</span></div>
+              </div>
+
+              <div class="proxy-row">
+                <span class="meta-k">代理</span>
+                <n-select
+                  :value="proxySelectValue(row)"
+                  :options="proxySelectOptions(row)"
+                  size="small"
+                  :consistent-menu-width="false"
+                  @update:value="(v: string) => onProxyChange(row, v)"
+                />
+              </div>
+
+              <div class="acc-err" v-if="row.last_error" :title="row.last_error">
+                最近错误：{{ row.last_error }}
+              </div>
+
+              <!-- 操作 -->
+              <template #action>
+                <n-space :size="6">
+                  <n-button size="small" type="primary" ghost :loading="quotaLoading[row.id]" @click="doQuota(row.id)">查额度</n-button>
+                  <n-button size="small" @click="doRefresh(row.id)">刷新 token</n-button>
+                  <n-button size="small" @click="doResetCooldown(row.id)">清除冷却</n-button>
+                  <n-popconfirm @positive-click="() => doDelete(row.id)">
+                    <template #trigger>
+                      <n-button size="small" type="error" ghost>删除</n-button>
+                    </template>
+                    确定删除该账号？
+                  </n-popconfirm>
+                </n-space>
+              </template>
+            </n-card>
+          </n-gi>
+        </n-grid>
+      </n-spin>
+
       <div style="margin-top: 12px; display: flex; justify-content: flex-end">
         <n-pagination
           v-model:page="page"
@@ -430,3 +517,99 @@ async function doRebalance() {
     </n-modal>
   </n-space>
 </template>
+
+<style scoped>
+.acc-card {
+  height: 100%;
+}
+.acc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.acc-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.acc-email {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acc-org {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #909399;
+}
+.quota-box {
+  margin: 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.quota-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.quota-label {
+  width: 42px;
+  font-size: 12px;
+  color: #606266;
+  flex-shrink: 0;
+}
+.quota-line :deep(.n-progress) {
+  flex: 1;
+}
+.quota-percent {
+  width: 40px;
+  text-align: right;
+  font-size: 12px;
+  color: #606266;
+  flex-shrink: 0;
+}
+.quota-checked {
+  font-size: 11px;
+}
+.meta-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+.meta-item {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+}
+.meta-k {
+  color: #909399;
+  flex-shrink: 0;
+}
+.meta-v {
+  color: #303133;
+}
+.proxy-row {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.proxy-row :deep(.n-select) {
+  flex: 1;
+}
+.acc-err {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #d03050;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.muted {
+  color: #909399;
+}
+</style>

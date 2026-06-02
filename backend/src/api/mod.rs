@@ -78,6 +78,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/claude/accounts/rebalance",
             post(claude_accounts::rebalance),
         )
+        .route(
+            "/claude/accounts/quota/refresh",
+            post(claude_accounts::refresh_quotas),
+        )
         .route("/claude/login/start", post(claude_accounts::login_start))
         .route("/claude/login/finish", post(claude_accounts::login_finish))
         .route(
@@ -87,6 +91,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/claude/accounts/:id/refresh",
             post(claude_accounts::manual_refresh),
+        )
+        .route(
+            "/claude/accounts/:id/quota",
+            post(claude_accounts::refresh_quota),
         )
         .route(
             "/claude/accounts/:id/reset-cooldown",

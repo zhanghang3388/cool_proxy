@@ -7,15 +7,34 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
 
 use crate::auth::claude::exchange_code;
+use crate::auth::claude_quota::fetch_claude_quota;
 use crate::state::AppState;
-use crate::store::claude_accounts::ClaudeAccountRow;
+use crate::store::claude_accounts::{ClaudeAccountQuotaUpdate, ClaudeAccountRow};
 
 // ===== 视图模型 =====
+
+/// 单个额度窗口（5h / week）。`remaining_percent = 100 - used_percent`。
+#[derive(Serialize)]
+pub struct QuotaWindowView {
+    pub used_percent: Option<f64>,
+    pub remaining_percent: Option<f64>,
+    pub reset_at: Option<String>,
+}
+
+/// 账号额度视图：5 小时 + 7 天窗口 + 查询时刻 / 错误。
+#[derive(Serialize)]
+pub struct ClaudeQuotaView {
+    pub five_hour: Option<QuotaWindowView>,
+    pub week: Option<QuotaWindowView>,
+    pub checked_at: Option<String>,
+    pub error: Option<String>,
+}
 
 #[derive(Serialize)]
 pub struct ClaudeAccountView {
@@ -34,6 +53,30 @@ pub struct ClaudeAccountView {
     pub expired: bool,
     pub proxy_url: String,
     pub proxy_id: Option<String>,
+    pub quota: ClaudeQuotaView,
+}
+
+fn quota_window_view(
+    used: Option<f64>,
+    reset_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<QuotaWindowView> {
+    if used.is_none() && reset_at.is_none() {
+        return None;
+    }
+    Some(QuotaWindowView {
+        used_percent: used,
+        remaining_percent: used.map(|u| (100.0 - u).clamp(0.0, 100.0)),
+        reset_at: reset_at.map(|t| t.to_rfc3339()),
+    })
+}
+
+fn quota_view(a: &ClaudeAccountRow) -> ClaudeQuotaView {
+    ClaudeQuotaView {
+        five_hour: quota_window_view(a.quota_5h_used_percent, a.quota_5h_reset_at),
+        week: quota_window_view(a.quota_week_used_percent, a.quota_week_reset_at),
+        checked_at: a.quota_checked_at.map(|t| t.to_rfc3339()),
+        error: a.quota_error.clone(),
+    }
 }
 
 fn account_view(
@@ -41,6 +84,7 @@ fn account_view(
     a: ClaudeAccountRow,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ClaudeAccountView {
+    let quota = quota_view(&a);
     ClaudeAccountView {
         expired: a.expires_at.map(|t| t <= now).unwrap_or(true),
         proxy_id: app.proxy_pool.id_by_url(&a.proxy_url),
@@ -57,6 +101,7 @@ fn account_view(
         total_requests: a.total_requests,
         total_failures: a.total_failures,
         proxy_url: a.proxy_url,
+        quota,
     }
 }
 
@@ -194,6 +239,102 @@ pub async fn manual_refresh(State(app): State<Arc<AppState>>, Path(id): Path<Str
             (StatusCode::BAD_GATEWAY, msg).into_response()
         }
     }
+}
+
+// ===== 额度查询（仅手动；/api/oauth/usage 会激进 429，绝不后台轮询）=====
+
+#[derive(Serialize)]
+pub struct QuotaRefreshItem {
+    pub id: String,
+    pub ok: bool,
+    pub quota: Option<ClaudeQuotaView>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct QuotaRefreshPayload {
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct QuotaRefreshResp {
+    pub items: Vec<QuotaRefreshItem>,
+}
+
+async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
+    let Some(acc) = app.claude_pool.get(&id) else {
+        return QuotaRefreshItem {
+            id,
+            ok: false,
+            quota: None,
+            error: Some("account not found".to_string()),
+        };
+    };
+    if acc.access_token.is_empty() {
+        let msg = "缺少 access_token，无法查询额度".to_string();
+        app.claude_pool.update_quota_error(&id, &msg);
+        let quota = app.claude_pool.get(&id).map(|a| quota_view(&a));
+        return QuotaRefreshItem {
+            id,
+            ok: false,
+            quota,
+            error: Some(msg),
+        };
+    }
+
+    let result = fetch_claude_quota(&app.clients, &acc.access_token, &acc.proxy_url).await;
+    let (ok, error) = match result {
+        Ok(snapshot) => {
+            let update = ClaudeAccountQuotaUpdate {
+                quota_5h_used_percent: snapshot.five_hour.as_ref().and_then(|w| w.used_percent),
+                quota_5h_reset_at: snapshot.five_hour.as_ref().and_then(|w| w.reset_at),
+                quota_week_used_percent: snapshot.week.as_ref().and_then(|w| w.used_percent),
+                quota_week_reset_at: snapshot.week.as_ref().and_then(|w| w.reset_at),
+                quota_error: None,
+            };
+            app.claude_pool.update_quota(&id, &update);
+            (true, None)
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            app.claude_pool.update_quota_error(&id, &msg);
+            (false, Some(msg))
+        }
+    };
+
+    let quota = app.claude_pool.get(&id).map(|a| quota_view(&a));
+    QuotaRefreshItem {
+        id,
+        ok,
+        quota,
+        error,
+    }
+}
+
+pub async fn refresh_quota(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let item = refresh_one_quota(app, id).await;
+    if item.quota.is_none() && item.error.as_deref() == Some("account not found") {
+        return (StatusCode::NOT_FOUND, "account not found").into_response();
+    }
+    Json(item).into_response()
+}
+
+pub async fn refresh_quotas(
+    State(app): State<Arc<AppState>>,
+    Json(payload): Json<QuotaRefreshPayload>,
+) -> Response {
+    let ids = if payload.ids.is_empty() {
+        app.claude_pool.all_ids_sorted()
+    } else {
+        payload.ids
+    };
+    let items = stream::iter(ids)
+        .map(|id| refresh_one_quota(app.clone(), id))
+        .buffer_unordered(6)
+        .collect::<Vec<_>>()
+        .await;
+    Json(QuotaRefreshResp { items }).into_response()
 }
 
 // ===== OAuth 登录（两步）=====

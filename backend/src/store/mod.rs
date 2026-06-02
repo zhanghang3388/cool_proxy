@@ -201,6 +201,13 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
     ensure_column(conn, "accounts", "quota_week_reset_at", "INTEGER")?;
     ensure_column(conn, "accounts", "quota_checked_at", "INTEGER")?;
     ensure_column(conn, "accounts", "quota_error", "TEXT")?;
+    // Claude 额度列（与 Codex 同形：5h/week used_percent + reset_at + checked/error）。
+    ensure_column(conn, "claude_accounts", "quota_5h_used_percent", "REAL")?;
+    ensure_column(conn, "claude_accounts", "quota_5h_reset_at", "INTEGER")?;
+    ensure_column(conn, "claude_accounts", "quota_week_used_percent", "REAL")?;
+    ensure_column(conn, "claude_accounts", "quota_week_reset_at", "INTEGER")?;
+    ensure_column(conn, "claude_accounts", "quota_checked_at", "INTEGER")?;
+    ensure_column(conn, "claude_accounts", "quota_error", "TEXT")?;
     Ok(())
 }
 

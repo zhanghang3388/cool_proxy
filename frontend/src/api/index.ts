@@ -427,6 +427,18 @@ export interface ClaudeAccountView {
   expired: boolean
   proxy_url: string
   proxy_id: string | null
+  quota: AccountQuotaView
+}
+
+export interface ClaudeQuotaRefreshItem {
+  id: string
+  ok: boolean
+  quota: AccountQuotaView | null
+  error: string | null
+}
+
+export interface ClaudeQuotaRefreshResp {
+  items: ClaudeQuotaRefreshItem[]
 }
 
 export interface ClaudeAccountListResp {
@@ -476,6 +488,16 @@ export async function setClaudeAccountProxy(
 }
 export async function getClaudeStats(): Promise<ClaudeStatsView> {
   const { data } = await http.get<ClaudeStatsView>('/claude/stats')
+  return data
+}
+export async function refreshClaudeAccountQuota(id: string): Promise<ClaudeQuotaRefreshItem> {
+  const { data } = await http.post<ClaudeQuotaRefreshItem>(
+    `/claude/accounts/${encodeURIComponent(id)}/quota`,
+  )
+  return data
+}
+export async function refreshClaudeAccountQuotas(ids: string[]): Promise<ClaudeQuotaRefreshResp> {
+  const { data } = await http.post<ClaudeQuotaRefreshResp>('/claude/accounts/quota/refresh', { ids })
   return data
 }
 export async function rebalanceClaudeProxies(only_unassigned: boolean): Promise<RebalanceResult> {

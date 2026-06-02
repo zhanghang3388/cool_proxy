@@ -188,6 +188,14 @@ impl ClaudePool {
         let _ = store_claude::mark_refresh_failed(&self.db, id, msg);
     }
 
+    pub fn update_quota(&self, id: &str, q: &store_claude::ClaudeAccountQuotaUpdate) -> bool {
+        store_claude::update_quota(&self.db, id, q).unwrap_or(false)
+    }
+
+    pub fn update_quota_error(&self, id: &str, msg: &str) -> bool {
+        store_claude::update_quota_error(&self.db, id, msg).unwrap_or(false)
+    }
+
     pub fn stats_overview(&self) -> anyhow::Result<ClaudeStatsCounts> {
         let (total, enabled, cooling, expired, total_req, total_fail) =
             store_claude::stats_overview(&self.db)?;

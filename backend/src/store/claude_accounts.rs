@@ -33,6 +33,13 @@ pub struct ClaudeAccountRow {
     pub total_failures: u64,
     pub proxy_url: String,
 
+    pub quota_5h_used_percent: Option<f64>,
+    pub quota_5h_reset_at: Option<DateTime<Utc>>,
+    pub quota_week_used_percent: Option<f64>,
+    pub quota_week_reset_at: Option<DateTime<Utc>>,
+    pub quota_checked_at: Option<DateTime<Utc>>,
+    pub quota_error: Option<String>,
+
     #[serde(skip)]
     pub raw_auth_token: Value,
 }
@@ -56,6 +63,12 @@ impl ClaudeAccountRow {
             total_requests: 0,
             total_failures: 0,
             proxy_url: String::new(),
+            quota_5h_used_percent: None,
+            quota_5h_reset_at: None,
+            quota_week_used_percent: None,
+            quota_week_reset_at: None,
+            quota_checked_at: None,
+            quota_error: None,
             raw_auth_token: data.raw_auth_token.clone(),
         }
     }
@@ -98,6 +111,12 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<ClaudeAccountRow> {
         total_requests: r.get::<_, i64>("total_requests")? as u64,
         total_failures: r.get::<_, i64>("total_failures")? as u64,
         proxy_url: r.get("proxy_url")?,
+        quota_5h_used_percent: r.get("quota_5h_used_percent")?,
+        quota_5h_reset_at: ms_to_dt(r.get("quota_5h_reset_at")?),
+        quota_week_used_percent: r.get("quota_week_used_percent")?,
+        quota_week_reset_at: ms_to_dt(r.get("quota_week_reset_at")?),
+        quota_checked_at: ms_to_dt(r.get("quota_checked_at")?),
+        quota_error: r.get("quota_error")?,
         raw_auth_token: json_from_str(&raw_auth_token),
     })
 }
@@ -372,6 +391,53 @@ pub fn mark_refresh_failed(pool: &SqlitePool, id: &str, msg: &str) -> Result<()>
         params![id, format!("refresh failed: {msg}")],
     )?;
     Ok(())
+}
+
+/// 额度查询成功后写回的字段集合（5h/week used_percent + reset_at）。
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeAccountQuotaUpdate {
+    pub quota_5h_used_percent: Option<f64>,
+    pub quota_5h_reset_at: Option<DateTime<Utc>>,
+    pub quota_week_used_percent: Option<f64>,
+    pub quota_week_reset_at: Option<DateTime<Utc>>,
+    pub quota_error: Option<String>,
+}
+
+/// 写回额度快照，并把 quota_checked_at 标到当前时刻。
+pub fn update_quota(pool: &SqlitePool, id: &str, q: &ClaudeAccountQuotaUpdate) -> Result<bool> {
+    let conn = pool.get()?;
+    let now = Utc::now().timestamp_millis();
+    let n = conn.execute(
+        "UPDATE claude_accounts SET
+            quota_5h_used_percent = ?2,
+            quota_5h_reset_at = ?3,
+            quota_week_used_percent = ?4,
+            quota_week_reset_at = ?5,
+            quota_checked_at = ?6,
+            quota_error = ?7
+         WHERE id = ?1",
+        params![
+            id,
+            q.quota_5h_used_percent,
+            dt_to_ms(q.quota_5h_reset_at),
+            q.quota_week_used_percent,
+            dt_to_ms(q.quota_week_reset_at),
+            now,
+            q.quota_error,
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// 额度查询失败：只记 checked_at + error，不动已有额度值。
+pub fn update_quota_error(pool: &SqlitePool, id: &str, msg: &str) -> Result<bool> {
+    let conn = pool.get()?;
+    let now = Utc::now().timestamp_millis();
+    let n = conn.execute(
+        "UPDATE claude_accounts SET quota_checked_at = ?2, quota_error = ?3 WHERE id = ?1",
+        params![id, now, msg],
+    )?;
+    Ok(n > 0)
 }
 
 /// 后台 refresher 用：enabled 且 refresh_token 非空、且即将（threshold 秒内）过期的账号。
