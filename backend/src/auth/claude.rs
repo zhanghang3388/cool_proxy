@@ -24,6 +24,42 @@ pub const SCOPE: &str =
 /// 待完成登录的有效期：超过则要求重新生成授权链接。
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// token 刷新失败的退避区间（照搬参考 claudeRefreshMin/MaxBackoff）。
+pub const REFRESH_MIN_BACKOFF: Duration = Duration::from_secs(5);
+pub const REFRESH_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// token 刷新失败的分类，决定调用方如何退避 / 重试。
+#[derive(Debug)]
+pub enum RefreshError {
+    /// 上游 429：附带建议的退避时长（已截断到 [`REFRESH_MIN_BACKOFF`, `REFRESH_MAX_BACKOFF`]）。
+    RateLimited { retry_after: Duration },
+    /// 4xx（非 429）：请求本身的问题，重试无意义。
+    Permanent(String),
+    /// 5xx / 网络 / 解析错误：可在下一轮重试。
+    Transient(String),
+}
+
+impl RefreshError {
+    /// 是否值得重试（仅瞬时错误）。
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, RefreshError::Transient(_))
+    }
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshError::RateLimited { retry_after } => {
+                write!(f, "rate limited (retry after {}s)", retry_after.as_secs())
+            }
+            RefreshError::Permanent(m) => write!(f, "permanent: {m}"),
+            RefreshError::Transient(m) => write!(f, "transient: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
 /// 解析后的 Claude OAuth 令牌数据。
 #[derive(Debug, Clone)]
 pub struct ClaudeTokenData {
@@ -273,13 +309,14 @@ pub async fn exchange_code(
     Ok(data)
 }
 
-/// 用 refresh_token 换新 access_token。
+/// 用 refresh_token 换新 access_token。失败时返回分类错误（[`RefreshError`]），
+/// 便于调用方区分 429（退避）/ 4xx（永久失败）/ 5xx（可重试）。
 pub async fn refresh_access_token(
     http: &reqwest::Client,
     refresh_token: &str,
-) -> Result<ClaudeTokenData> {
+) -> std::result::Result<ClaudeTokenData, RefreshError> {
     if refresh_token.trim().is_empty() {
-        anyhow::bail!("refresh token is required");
+        return Err(RefreshError::Permanent("refresh token is required".into()));
     }
     let req_body = json!({
         "client_id": CLIENT_ID,
@@ -294,27 +331,75 @@ pub async fn refresh_access_token(
         .json(&req_body)
         .send()
         .await
-        .with_context(|| "claude token refresh request")?;
+        .map_err(|e| RefreshError::Transient(format!("claude token refresh request: {e}")))?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!(
-            "token refresh failed: {} {}",
-            status,
-            body.chars().take(512).collect::<String>()
-        );
+        let code = status.as_u16();
+        if code == 429 {
+            let retry_after = parse_retry_after(resp.headers());
+            return Err(RefreshError::RateLimited { retry_after });
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let snippet = body.chars().take(512).collect::<String>();
+        let msg = format!("token refresh failed: {status} {snippet}");
+        // 5xx 视为瞬时可重试；其余 4xx 视为永久失败。
+        if status.is_server_error() {
+            return Err(RefreshError::Transient(msg));
+        }
+        return Err(RefreshError::Permanent(msg));
     }
-    let parsed: Value =
-        serde_json::from_str(&body).with_context(|| format!("parse refresh response: {body}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| RefreshError::Transient(format!("read refresh body: {e}")))?;
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|e| RefreshError::Transient(format!("parse refresh response: {e}: {body}")))?;
     let mut data = parse_token_response(&parsed);
     // 刷新返回可能不带 refresh_token：沿用旧的。
     if data.refresh_token.is_none() {
         data.refresh_token = Some(refresh_token.to_string());
     }
     if data.access_token.is_empty() {
-        anyhow::bail!("refresh response missing access_token");
+        return Err(RefreshError::Permanent(
+            "refresh response missing access_token".into(),
+        ));
     }
     Ok(data)
+}
+
+/// 解析 `Retry-After`（秒）/ `Retry-After-Ms`（毫秒）头，截断到退避区间。
+/// 解析失败或缺失时返回 [`REFRESH_MIN_BACKOFF`]。
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
+    if let Some(raw) = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+    {
+        if let Ok(secs) = raw.parse::<u64>() {
+            return clamp_backoff(Duration::from_secs(secs));
+        }
+        // HTTP-date 形式：算到该时刻的间隔。
+        if let Ok(when) = DateTime::parse_from_rfc2822(raw) {
+            let delta = when.with_timezone(&Utc) - Utc::now();
+            if let Ok(d) = delta.to_std() {
+                return clamp_backoff(d);
+            }
+            return REFRESH_MIN_BACKOFF;
+        }
+    }
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return clamp_backoff(Duration::from_millis(ms));
+    }
+    REFRESH_MIN_BACKOFF
+}
+
+/// 把退避时长截断到 [`REFRESH_MIN_BACKOFF`, `REFRESH_MAX_BACKOFF`]。
+fn clamp_backoff(d: Duration) -> Duration {
+    d.clamp(REFRESH_MIN_BACKOFF, REFRESH_MAX_BACKOFF)
 }
 
 // ===== 待完成登录的内存暂存 =====

@@ -21,9 +21,17 @@ use crate::state::AppState;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_BETA: &str =
-    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
-const CLAUDE_USER_AGENT: &str = "claude-cli/2.0.1 (external, cli)";
+/// 兜底 beta 集合：仅当客户端**没带** `anthropic-beta` 头时使用。Claude Code 自己会发一份
+/// 完整的 beta 列表（含 `context-management-2025-06-27` 等），那种情况下以客户端的为准——
+/// 否则新版本 Claude Code 往请求体里塞的新字段（如 `context_management`）会被上游判为
+/// "Extra inputs are not permitted"。这份兜底与上游 CLI 当前默认保持一致。
+const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27";
+/// 出站 User-Agent。版本需与 cloak::CLAUDE_CODE_VERSION（billing header 的 cc_version）一致，
+/// 对齐 Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 的指纹基线。
+const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.63 (external, cli)";
+/// Stainless SDK 指纹头（与上面 UA 的 SDK 版本对齐）。
+const STAINLESS_PACKAGE_VERSION: &str = "0.74.0";
+const STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
 /// 列模型时只带 OAuth beta（其余 messages 专用 beta 不发，降低被上游 400 的概率）。
 const ANTHROPIC_BETA_OAUTH: &str = "oauth-2025-04-20";
 
@@ -41,6 +49,51 @@ fn anthropic_error(status: StatusCode, message: &str) -> Response {
         }
     });
     (status, axum::Json(body)).into_response()
+}
+
+/// 计算最终发往上游的 `anthropic-beta` 头。
+///
+/// 客户端（Claude Code）自己会带一份完整的 beta 列表，里面含 `context-management-*` 等新版本
+/// 才有的开关；这些开关与请求体里的新字段（如 `context_management`）一一对应，缺了上游就会
+/// 报 "Extra inputs are not permitted"。所以**以客户端的头为准**，只补齐 OAuth 令牌放行必需的
+/// `oauth-*` 与 `interleaved-thinking-*`。客户端没带头时退回到内置兜底集合。
+fn effective_anthropic_beta(client_beta: Option<&str>) -> String {
+    let base = match client_beta.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => return ANTHROPIC_BETA.to_string(),
+    };
+    let mut betas: Vec<String> = base
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // (特性前缀, 缺失时补的完整 beta)：按前缀判断是否已有该特性的某个版本。
+    for (prefix, full) in [
+        ("oauth", "oauth-2025-04-20"),
+        ("interleaved-thinking", "interleaved-thinking-2025-05-14"),
+    ] {
+        if !betas.iter().any(|b| b.starts_with(prefix)) {
+            betas.push(full.to_string());
+        }
+    }
+    betas.join(",")
+}
+
+/// 从入站请求头里取一个稳定的客户端标识（API key），用于按客户端缓存假 user_id。
+/// 优先 `x-api-key`，否则 `Authorization: Bearer`。取不到时返回 `"default"`。
+fn client_key_hint(headers: &axum::http::HeaderMap) -> String {
+    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        if !k.is_empty() {
+            return k.to_string();
+        }
+    }
+    if let Some(a) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        let k = a.trim_start_matches("Bearer ").trim();
+        if !k.is_empty() {
+            return k.to_string();
+        }
+    }
+    "default".to_string()
 }
 
 /// 静态兜底模型清单：动态拉取失败 / 无可用账号时返回。
@@ -236,9 +289,22 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
     }
     let client_wants_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // 伪装一次（与账号无关），所有重试复用同一份请求体。
+    // 客户端发来的 anthropic-beta 头（Claude Code 会带一份完整列表），用于计算最终上游头。
+    let client_beta = parts
+        .headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let upstream_beta = effective_anthropic_beta(client_beta.as_deref());
+
+    // 入站客户端标识（API key），用于按客户端缓存假 user_id，保持会话连续性。
+    let client_key = client_key_hint(&parts.headers);
+
+    // 伪装一次（与上游账号无关），所有重试复用同一份请求体。
     let mut cloaked = raw;
-    let reverse_map = cloak::apply_oauth_cloaking(&mut cloaked);
+    let reverse_map = cloak::apply_oauth_cloaking(&mut cloaked, &client_key);
+    // 规范化请求体，修掉会被上游直接 400 的字段组合（thinking/temperature/max_tokens/budget）。
+    cloak::normalize_request_body(&mut cloaked);
     let cloaked_bytes = Bytes::from(serde_json::to_vec(&cloaked).unwrap_or_default());
 
     let max_attempts = app.config.retry.max_retries.max(1);
@@ -279,6 +345,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
             &cloaked_bytes,
             &selected.access_token,
             client_wants_stream,
+            &upstream_beta,
         )
         .await;
 
@@ -406,13 +473,39 @@ fn spawn_claude_refresh(app: Arc<AppState>, id: String) {
     });
 }
 
+/// 把编译期目标 OS 映射成 Stainless SDK 的 OS 名（照搬参考 `mapStainlessOS`）。
+fn stainless_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "MacOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "freebsd" => "FreeBSD",
+        other => match other {
+            "android" => "Android",
+            _ => "Other",
+        },
+    }
+}
+
+/// 把编译期目标架构映射成 Stainless SDK 的 arch 名（照搬参考 `mapStainlessArch`）。
+fn stainless_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        _ => "other",
+    }
+}
+
 /// 构造并发送到 Anthropic 上游的请求。`stream` 决定 Accept / Accept-Encoding。
+/// `beta` 是已算好的 `anthropic-beta` 头值（见 [`effective_anthropic_beta`]）。
 async fn forward_claude(
     clients: &crate::proxy::ProxiedClients,
     proxy_url: &str,
     body: &Bytes,
     access_token: &str,
     stream: bool,
+    beta: &str,
 ) -> anyhow::Result<reqwest::Response> {
     let http = clients.get(proxy_url)?;
     let url = format!("{UPSTREAM_BASE}/v1/messages?beta=true");
@@ -422,12 +515,19 @@ async fn forward_claude(
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {access_token}"))
         .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("anthropic-beta", ANTHROPIC_BETA)
+        .header("anthropic-beta", beta)
         .header("x-app", "cli")
         .header("User-Agent", CLAUDE_USER_AGENT)
         .header("x-stainless-lang", "js")
         .header("x-stainless-runtime", "node")
         .header("x-stainless-retry-count", "0")
+        .header("x-stainless-timeout", "600")
+        .header("x-stainless-package-version", STAINLESS_PACKAGE_VERSION)
+        .header("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION)
+        .header("x-stainless-os", stainless_os())
+        .header("x-stainless-arch", stainless_arch())
+        // 每请求唯一 ID，对齐官方 CLI 一方 API 的 x-client-request-id。
+        .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
         .body(body.clone());
     if stream {
         // SSE 必须不压缩，否则按行扫描读不了。
@@ -658,4 +758,35 @@ async fn aggregate_response(
     );
 
     (StatusCode::OK, axum::Json(obj)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn beta_falls_back_when_client_sends_none() {
+        assert_eq!(effective_anthropic_beta(None), ANTHROPIC_BETA);
+        assert_eq!(effective_anthropic_beta(Some("")), ANTHROPIC_BETA);
+        assert_eq!(effective_anthropic_beta(Some("   ")), ANTHROPIC_BETA);
+    }
+
+    #[test]
+    fn beta_honors_client_header_and_keeps_context_management() {
+        // 这是新版 Claude Code 实际会带的那种头：必须原样保留 context-management。
+        let client = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,fine-grained-tool-streaming-2025-05-14";
+        let out = effective_anthropic_beta(Some(client));
+        assert!(out.contains("context-management-2025-06-27"));
+        // 客户端已带 oauth / interleaved，不应重复追加。
+        assert_eq!(out.matches("oauth-").count(), 1);
+        assert_eq!(out.matches("interleaved-thinking-").count(), 1);
+    }
+
+    #[test]
+    fn beta_appends_required_flags_when_missing() {
+        let out = effective_anthropic_beta(Some("context-management-2025-06-27"));
+        assert!(out.starts_with("context-management-2025-06-27"));
+        assert!(out.contains("oauth-2025-04-20"));
+        assert!(out.contains("interleaved-thinking-2025-05-14"));
+    }
 }
