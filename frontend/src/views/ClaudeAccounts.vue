@@ -248,7 +248,6 @@ async function startLogin() {
     authUrl.value = res.auth_url
     loginState.value = res.state
     loginStep.value = 2
-    window.open(res.auth_url, '_blank')
   } catch (e) {
     message.error(`获取授权链接失败：${(e as Error).message}`)
   } finally {
@@ -479,12 +478,16 @@ async function doRebalance() {
         </template>
 
         <template v-else>
-          <n-alert type="success" :show-icon="false">
-            已在新标签打开授权页。若没弹出，<a :href="authUrl" target="_blank">点此打开</a>，或
-            <a href="javascript:void(0)" @click="copyAuthUrl">复制链接</a>。<br />
+          <n-alert type="info" :show-icon="false">
+            复制下面的授权链接，自行在浏览器中打开并完成授权。<br />
             授权后浏览器会跳到 <code>http://localhost:54545/callback?code=...</code>（页面打不开是正常的，本机没有监听）。
             <b>直接把地址栏那一整条 URL 复制粘贴到下面即可</b>，也可只粘 <code>code</code> 的值。
           </n-alert>
+          <n-input :value="authUrl" readonly type="textarea" :autosize="{ minRows: 2, maxRows: 4 }" spellcheck="false" />
+          <n-space>
+            <n-button size="small" @click="copyAuthUrl">复制授权链接</n-button>
+            <n-button size="small" tag="a" :href="authUrl" target="_blank">在新标签打开</n-button>
+          </n-space>
           <n-input
             v-model:value="loginCode"
             type="textarea"
