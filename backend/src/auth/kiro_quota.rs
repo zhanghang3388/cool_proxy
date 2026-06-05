@@ -115,6 +115,8 @@ async fn send_usage(
     machine_id: &str,
 ) -> Result<(reqwest::StatusCode, String)> {
     let url = format!("{}/getUsageLimits", endpoint.trim_end_matches('/'));
+    // 诊断用：明确记录实际发出的 getUsageLimits（不带 profileArn）。
+    tracing::info!("kiro getUsageLimits GET {url} (origin=AI_EDITOR, 无 profileArn)");
     let resp = http
         .get(&url)
         .timeout(Duration::from_secs(30))
