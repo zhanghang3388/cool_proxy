@@ -336,26 +336,13 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
         }
     }
 
-    // 没有显式 profile_arn 时按登录方式兜底（与上游转发 resolve_profile_arn 一致：
-    // social → social ARN，idc/企业 → Builder-ID ARN），否则 IdC 账号永远查不了额度。
-    let profile_arn = crate::pool::kiro::resolve_profile_arn(&acc);
-    if profile_arn.trim().is_empty() {
-        let msg = "缺少 profile_arn，无法查询额度".to_string();
-        app.kiro_pool.update_quota_error(&id, &msg);
-        let usage = app.kiro_pool.get(&id).map(|a| usage_view(&a));
-        return QuotaRefreshItem {
-            id,
-            ok: false,
-            usage,
-            error: Some(msg),
-        };
-    }
-
+    // 注意：getUsageLimits 不传 profileArn——Kiro-account-manager 所有调用点都传 undefined，
+    // 让上游按 token 自身身份推断 profile。传一个占位 profileArn（属于别的 AWS 账号）正是
+    // 企业 IdC token 被判 "bearer token invalid" 的根因。
     let result = fetch_kiro_usage(
         &app.clients,
         &acc.id,
         &acc.access_token,
-        &profile_arn,
         acc.idc_region.as_deref(),
         &acc.proxy_url,
     )

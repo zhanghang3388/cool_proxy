@@ -10,8 +10,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::auth::kiro::{
-    get_path_value, normalize_non_empty, parse_profile_arn_region, parse_timestamp, pick_number,
-    pick_string, runtime_endpoint_for_region,
+    get_path_value, normalize_non_empty, parse_timestamp, pick_number, pick_string,
+    runtime_endpoint_for_region,
 };
 use crate::proxy::ProxiedClients;
 
@@ -61,23 +61,16 @@ pub async fn fetch_kiro_usage(
     clients: &Arc<ProxiedClients>,
     account_id: &str,
     access_token: &str,
-    profile_arn: &str,
     idc_region: Option<&str>,
     proxy_url: &str,
 ) -> Result<KiroUsageSnapshot> {
     if access_token.trim().is_empty() {
         anyhow::bail!("missing access_token");
     }
-    if profile_arn.trim().is_empty() {
-        anyhow::bail!("missing profile_arn（无法定位 Kiro runtime endpoint）");
-    }
 
-    // 端点优先按账号自身 region（idc_region）选择，否则回退到 profile_arn 里的 region。
-    let region = idc_region
-        .map(str::to_string)
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| parse_profile_arn_region(profile_arn));
-    let primary = runtime_endpoint_for_region(region.as_deref());
+    // 端点按账号自身 region（idc_region）选择，缺省 us-east-1。
+    let region = idc_region.filter(|s| !s.trim().is_empty());
+    let primary = runtime_endpoint_for_region(region);
     // 403 视为区域不对（不是封禁），回退另一个区域端点——与 Kiro-account-manager 一致。
     let fallback = if primary.contains("eu-central-1") {
         "https://q.us-east-1.amazonaws.com"
@@ -88,10 +81,9 @@ pub async fn fetch_kiro_usage(
     let machine_id = stable_machine_id(account_id);
     let http = clients.get(proxy_url)?;
 
-    let (status, body) =
-        send_usage(&http, &primary, profile_arn, access_token, &machine_id).await?;
+    let (status, body) = send_usage(&http, &primary, access_token, &machine_id).await?;
     let (status, body) = if status == reqwest::StatusCode::FORBIDDEN {
-        send_usage(&http, fallback, profile_arn, access_token, &machine_id).await?
+        send_usage(&http, fallback, access_token, &machine_id).await?
     } else {
         (status, body)
     };
@@ -113,12 +105,12 @@ pub async fn fetch_kiro_usage(
     Ok(parse_usage_snapshot(usage))
 }
 
-/// 向某个区域端点发起一次 getUsageLimits，返回 (status, body)。逐字对齐
-/// Kiro-account-manager 的 `fetchRestApi`：只带 Accept / Authorization / UA 两件套。
+/// 向某个区域端点发起一次 getUsageLimits，返回 (status, body)。逐字对齐 Kiro-account-manager
+/// 的 `fetchRestApi`：只带 Accept / Authorization / UA 两件套，**不传 profileArn**
+/// （KAM 所有 getUsageLimits 调用点都不传，由上游按 token 身份推断 profile）。
 async fn send_usage(
     http: &reqwest::Client,
     endpoint: &str,
-    profile_arn: &str,
     access_token: &str,
     machine_id: &str,
 ) -> Result<(reqwest::StatusCode, String)> {
@@ -130,7 +122,6 @@ async fn send_usage(
             ("origin", "AI_EDITOR"),
             ("resourceType", "AGENTIC_REQUEST"),
             ("isEmailRequired", "true"),
-            ("profileArn", profile_arn),
         ])
         .header("Accept", "application/json")
         .header("Authorization", format!("Bearer {}", access_token.trim()))
