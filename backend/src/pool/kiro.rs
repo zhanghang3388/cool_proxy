@@ -35,25 +35,38 @@ pub struct SelectedKiroAccount {
     pub proxy_url: String,
 }
 
-/// social 登录（Google/Github）兜底 profileArn。
+/// social 登录（Google/Github）共用的固定 profileArn（非占位，正常发送）。
 const KIRO_SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
-/// Builder-ID / IdC 兜底 profileArn。
-const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+/// Builder-ID / 企业 IdC 的**占位** profileArn（属于另一个 AWS 账号）。它**不应**发往上游——
+/// 发送会让企业/IdC token 被判 "bearer token invalid"。仅作"无真实 profileArn"的标记，由
+/// 调用方用 [`is_placeholder_profile_arn`] 剔除。对齐 Kiro-account-manager v1.7.4。
+const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 
-/// 解析账号最终用于上游的 profileArn：账号自带优先，否则按登录方式兜底。
+/// 是否为已知占位 profileArn（旧反代 / Kiro IDE 可能写入的脏数据）。占位 ARN 不发往上游。
+pub fn is_placeholder_profile_arn(arn: &str) -> bool {
+    arn.trim() == KIRO_BUILDER_ID_PLACEHOLDER_ARN
+}
+
+/// 解析账号上游用的 profileArn：账号自带的**真实（非占位）** ARN 优先，否则按登录方式兜底。
+/// 返回值可能是占位 ARN——调用方需用 [`is_placeholder_profile_arn`] 判断后决定是否发送。
 pub fn resolve_profile_arn(acc: &KiroAccountRow) -> String {
     if let Some(arn) = acc.profile_arn.as_deref() {
-        if !arn.trim().is_empty() {
+        let arn = arn.trim();
+        if !arn.is_empty() && !is_placeholder_profile_arn(arn) {
             return arn.to_string();
         }
     }
-    let provider = acc.login_provider.as_deref().unwrap_or("").to_ascii_lowercase();
+    let provider = acc
+        .login_provider
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if provider == "github" || provider == "google" {
         KIRO_SOCIAL_PROFILE_ARN.to_string()
     } else if acc.auth_method.eq_ignore_ascii_case("idc") {
-        KIRO_BUILDER_ID_PROFILE_ARN.to_string()
+        KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()
     } else {
         // 默认按 social 兜底（大多数导入账号是社交登录）
         KIRO_SOCIAL_PROFILE_ARN.to_string()
@@ -132,7 +145,12 @@ impl KiroPool {
                 continue;
             }
             let _ = store_kiro::mark_used(&self.db, id);
-            let profile_arn = resolve_profile_arn(&a);
+            // 占位 profileArn 不发给上游（与 Kiro-account-manager v1.7.4 一致：发送占位 ARN
+            // 会让企业/IdC token 被判 invalid）。剥成空串，build_payload 会省略 profileArn 字段。
+            let mut profile_arn = resolve_profile_arn(&a);
+            if is_placeholder_profile_arn(&profile_arn) {
+                profile_arn.clear();
+            }
             return Ok(SelectedKiroAccount {
                 id: a.id,
                 access_token: a.access_token,
