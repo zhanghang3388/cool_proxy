@@ -376,6 +376,30 @@ export async function importKiroAccountsJson(
   return data
 }
 
+export interface KiroSsoLoginStartResp {
+  auth_url: string
+  state: string
+}
+
+export async function kiroSsoLoginStart(payload: {
+  start_url: string
+  region?: string
+  proxy_id?: string
+  url?: string
+  email?: string
+}): Promise<KiroSsoLoginStartResp> {
+  const { data } = await http.post<KiroSsoLoginStartResp>('/kiro/login/start', payload)
+  return data
+}
+
+export async function kiroSsoLoginFinish(payload: {
+  state: string
+  code: string
+}): Promise<{ ok: boolean; account: KiroAccountView }> {
+  const { data } = await http.post('/kiro/login/finish', payload)
+  return data
+}
+
 export async function patchKiroAccount(id: string, payload: { enabled?: boolean }): Promise<void> {
   await http.patch(`/kiro/accounts/${encodeURIComponent(id)}`, payload)
 }

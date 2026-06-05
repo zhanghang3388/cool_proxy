@@ -12,6 +12,7 @@ import {
   listKiroAccounts, uploadKiroAccounts, importKiroAccountsJson, deleteKiroAccount,
   refreshKiroAccount, resetKiroCooldown, patchKiroAccount, getKiroStats, listProxies,
   setKiroAccountProxy, refreshKiroAccountQuota, refreshKiroAccountQuotas,
+  kiroSsoLoginStart, kiroSsoLoginFinish,
 } from '../api'
 import type { KiroQuotaRefreshItem } from '../api'
 
@@ -432,6 +433,93 @@ async function submitPaste() {
     pasting.value = false
   }
 }
+
+// ===== 企业 SSO（AWS IAM Identity Center / Start URL）登录 =====
+const showSso = ref(false)
+const ssoStep = ref<1 | 2>(1)
+const ssoProxyId = ref('__direct__')
+const ssoStartUrl = ref('')
+const ssoRegion = ref('us-east-1')
+const ssoEmail = ref('')
+const ssoAuthUrl = ref('')
+const ssoState = ref('')
+const ssoCode = ref('')
+const ssoBusy = ref(false)
+
+const ssoProxyOptions = computed(() => [
+  { label: '直连', value: '__direct__' },
+  ...proxies.value.map((p) => ({
+    label: p.label ? `${p.label} (${p.url})` : p.url,
+    value: p.id,
+  })),
+])
+
+function openSso() {
+  ssoStep.value = 1
+  ssoProxyId.value = '__direct__'
+  ssoStartUrl.value = ''
+  ssoRegion.value = 'us-east-1'
+  ssoEmail.value = ''
+  ssoAuthUrl.value = ''
+  ssoState.value = ''
+  ssoCode.value = ''
+  showSso.value = true
+}
+
+async function startSso() {
+  const startUrl = ssoStartUrl.value.trim()
+  if (!startUrl.startsWith('https://')) {
+    message.warning('请填写以 https:// 开头的 Start URL')
+    return
+  }
+  ssoBusy.value = true
+  try {
+    const proxyId = ssoProxyId.value === '__direct__' ? '' : ssoProxyId.value
+    const res = await kiroSsoLoginStart({
+      start_url: startUrl,
+      region: ssoRegion.value.trim() || 'us-east-1',
+      proxy_id: proxyId,
+      email: ssoEmail.value.trim() || undefined,
+    })
+    ssoAuthUrl.value = res.auth_url
+    ssoState.value = res.state
+    ssoStep.value = 2
+  } catch (e) {
+    const err = e as { response?: { data?: string }; message: string }
+    message.error(`获取授权链接失败：${err.response?.data || err.message}`)
+  } finally {
+    ssoBusy.value = false
+  }
+}
+
+async function finishSso() {
+  const code = ssoCode.value.trim()
+  if (!code) {
+    message.warning('请粘贴授权码或回调 URL')
+    return
+  }
+  ssoBusy.value = true
+  try {
+    const res = await kiroSsoLoginFinish({ state: ssoState.value, code })
+    message.success(`已添加账号 ${res.account.email || res.account.id}`)
+    showSso.value = false
+    await refresh()
+  } catch (e) {
+    const err = e as { response?: { data?: string }; message: string }
+    message.error(`登录失败：${err.response?.data || err.message}`)
+  } finally {
+    ssoBusy.value = false
+  }
+}
+
+async function copySsoUrl() {
+  try {
+    await navigator.clipboard.writeText(ssoAuthUrl.value)
+    message.success('已复制授权链接')
+  } catch {
+    message.warning('复制失败，请手动选择链接复制')
+  }
+}
 </script>
 
 <template>
@@ -464,6 +552,7 @@ async function submitPaste() {
             <n-button type="primary">上传认证文件</n-button>
           </n-upload>
           <n-button @click="openPaste">粘贴 JSON</n-button>
+          <n-button @click="openSso">企业 SSO 登录</n-button>
           <n-button @click="doRefreshPageQuota" :loading="bulkQuotaLoading">刷新本页额度</n-button>
           <n-button @click="() => refresh({ autoQuota: true })" :loading="loading">手动刷新</n-button>
         </n-space>
@@ -507,6 +596,86 @@ async function submitPaste() {
         </n-space>
       </n-space>
     </n-modal>
+
+    <n-modal
+      v-model:show="showSso"
+      preset="card"
+      title="企业 SSO 登录（IAM Identity Center）"
+      style="width: 720px"
+    >
+      <n-space vertical :size="12">
+        <n-alert type="info" :show-icon="false">
+          用组织的 SSO Start URL 登录企业 Kiro 账号。第 1 步填 Start URL + 区域获取授权链接；
+          第 2 步自行在浏览器打开链接完成组织授权，再把回调地址栏里的内容（含
+          <code>code=</code>）整段粘回。
+        </n-alert>
+
+        <div>
+          <div class="sso-label">代理</div>
+          <n-select
+            v-model:value="ssoProxyId"
+            :options="ssoProxyOptions"
+            :disabled="ssoStep === 2"
+            size="small"
+            consistent-menu-width
+          />
+        </div>
+
+        <template v-if="ssoStep === 1">
+          <div>
+            <div class="sso-label">SSO Start URL</div>
+            <n-input
+              v-model:value="ssoStartUrl"
+              placeholder="https://your-org.awsapps.com/start"
+              clearable
+            />
+          </div>
+          <div>
+            <div class="sso-label">区域</div>
+            <n-input v-model:value="ssoRegion" placeholder="us-east-1" clearable />
+          </div>
+          <div>
+            <div class="sso-label">邮箱 / 备注（可选，用于识别与去重）</div>
+            <n-input v-model:value="ssoEmail" placeholder="可填该企业账号邮箱" clearable />
+          </div>
+          <n-space justify="end">
+            <n-button @click="showSso = false">取消</n-button>
+            <n-button type="primary" :loading="ssoBusy" @click="startSso">获取授权链接</n-button>
+          </n-space>
+        </template>
+
+        <template v-else>
+          <n-alert type="info" :show-icon="false">
+            复制下面的授权链接，自行在浏览器打开并完成组织授权。授权后浏览器会跳到一个打不开的
+            <code>127.0.0.1</code> 地址——把那条地址（含 <code>code=</code>）整段复制粘到下面即可。
+          </n-alert>
+          <n-input
+            :value="ssoAuthUrl"
+            readonly
+            type="textarea"
+            :autosize="{ minRows: 2, maxRows: 4 }"
+          />
+          <n-space>
+            <n-button size="small" @click="copySsoUrl">复制授权链接</n-button>
+            <n-button size="small" tag="a" :href="ssoAuthUrl" target="_blank">在新标签打开</n-button>
+          </n-space>
+          <n-input
+            v-model:value="ssoCode"
+            type="textarea"
+            :autosize="{ minRows: 2, maxRows: 4 }"
+            placeholder="粘贴回调 URL 或 code"
+            spellcheck="false"
+          />
+          <n-space justify="space-between">
+            <n-button text @click="ssoStep = 1">← 重新填写</n-button>
+            <n-space>
+              <n-button @click="showSso = false">取消</n-button>
+              <n-button type="primary" :loading="ssoBusy" @click="finishSso">完成登录</n-button>
+            </n-space>
+          </n-space>
+        </template>
+      </n-space>
+    </n-modal>
   </n-space>
 </template>
 
@@ -537,5 +706,11 @@ async function submitPaste() {
   color: #303133;
   font-size: 12px;
   text-align: right;
+}
+
+.sso-label {
+  margin-bottom: 6px;
+  color: #909399;
+  font-size: 13px;
 }
 </style>

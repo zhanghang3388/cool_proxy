@@ -138,15 +138,23 @@ impl KiroRefresher {
 
         let endpoint = KIRO_AWS_OIDC_TOKEN_ENDPOINT_FMT.replace("{region}", region.as_str());
         let http = self.clients.get(&acc.proxy_url)?;
+        // AWS SSO-OIDC 的 /token 是 restJson1 协议：必须 JSON body + camelCase 字段
+        // （对齐 kiro.rs / KiroX / Kiro-account-manager）。早先用 form 编码 + snake_case
+        // 会被端点直接 400，导致 IdC / 企业账号永远刷不动 token。
+        let body = json!({
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "refreshToken": refresh_token,
+            "grantType": "refresh_token",
+        });
         let resp = http
             .post(&endpoint)
             .timeout(Duration::from_secs(60))
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", client_id.as_str()),
-                ("client_secret", client_secret.as_str()),
-            ])
+            .header("Content-Type", "application/json")
+            .header("x-amz-user-agent", "aws-sdk-js/3.980.0 KiroIDE")
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=4")
+            .json(&body)
             .send()
             .await
             .with_context(|| "kiro idc oidc request")?;

@@ -530,6 +530,158 @@ pub async fn upload(State(app): State<Arc<AppState>>, mut multipart: Multipart) 
     Json(body).into_response()
 }
 
+// ===== 企业 SSO（AWS IAM Identity Center / Start URL）登录 =====
+
+#[derive(Deserialize)]
+pub struct SsoLoginStartPayload {
+    /// 组织 SSO Start URL，例如 https://your-org.awsapps.com/start
+    pub start_url: String,
+    /// AWS 区域，缺省 us-east-1。
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 可选：登录及后续请求走的代理（id 优先，其次 url）。
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// 可选：邮箱/备注，用于生成稳定账号 id（便于重复登录覆盖同一行）。
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SsoLoginStartResp {
+    pub auth_url: String,
+    pub state: String,
+}
+
+/// 第一步：注册 OIDC 客户端并返回授权链接（展示在页面，由用户手动打开完成组织授权）。
+pub async fn sso_login_start(
+    State(app): State<Arc<AppState>>,
+    Json(payload): Json<SsoLoginStartPayload>,
+) -> Response {
+    let start_url = payload.start_url.trim().to_string();
+    if !start_url.starts_with("https://") {
+        return (StatusCode::BAD_REQUEST, "Start URL 必须以 https:// 开头").into_response();
+    }
+    let region = payload
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("us-east-1")
+        .to_string();
+
+    // 解析代理（用于 register/authorize/token 及绑定到账号，全程同一出口）。
+    let proxy_url = if let Some(pid) = payload.proxy_id.as_deref().filter(|s| !s.is_empty()) {
+        match app.proxy_pool.url_by_id(pid) {
+            Some(u) => u,
+            None => return (StatusCode::NOT_FOUND, "proxy not found").into_response(),
+        }
+    } else {
+        payload.url.clone().unwrap_or_default()
+    };
+
+    let http = match app.clients.get(&proxy_url) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("proxy error: {e}")).into_response(),
+    };
+
+    let email_hint = payload
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    match app
+        .kiro_login
+        .start(&http, &start_url, &region, &proxy_url, email_hint)
+        .await
+    {
+        Ok((auth_url, state)) => Json(SsoLoginStartResp { auth_url, state }).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SsoLoginFinishPayload {
+    pub state: String,
+    pub code: String,
+}
+
+/// 第二步：回填授权码，换 token 并入池（自动判成 idc / 企业账号）。
+pub async fn sso_login_finish(
+    State(app): State<Arc<AppState>>,
+    Json(payload): Json<SsoLoginFinishPayload>,
+) -> Response {
+    // peek 不消费：换 token 失败时保留上下文，便于用户改正授权码后重试。
+    let Some(pending) = app.kiro_login.peek(&payload.state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "登录已过期或 state 无效，请重新获取授权链接",
+        )
+            .into_response();
+    };
+
+    let http = match app.clients.get(&pending.proxy_url) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("proxy error: {e}")).into_response(),
+    };
+
+    let token = match crate::auth::kiro_sso::exchange_code(&http, &pending, &payload.code).await {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    };
+    // 换 token 成功，消费掉这次登录的 state。
+    app.kiro_login.remove(&payload.state);
+
+    // 把 token 响应与登录时收集的 IdC 元数据合并，交给统一解析；detect_idc 会判成 idc。
+    let merged = json!({
+        "accessToken": token.get("accessToken").or_else(|| token.get("access_token")),
+        "refreshToken": token.get("refreshToken").or_else(|| token.get("refresh_token")),
+        "expiresIn": token.get("expiresIn").or_else(|| token.get("expires_in")),
+        "clientId": pending.client_id,
+        "clientSecret": pending.client_secret,
+        "idcRegion": pending.region,
+        "region": pending.region,
+        "issuerUrl": pending.start_url,
+        "authMethod": "idc",
+        "provider": "enterprise",
+        "email": pending.email_hint,
+    });
+
+    let data = match KiroTokenData::from_value(&merged) {
+        Ok(d) => d,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("解析 token 失败: {e}")).into_response()
+        }
+    };
+    if data.access_token.is_empty() {
+        return (StatusCode::BAD_GATEWAY, "token 交换未返回 accessToken").into_response();
+    }
+
+    let acc = match app.kiro_pool.add_or_replace(&data) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // 绑定代理：登录时选了就用它，否则自动分配一个。
+    if !pending.proxy_url.trim().is_empty() {
+        let _ = app.kiro_pool.set_proxy(&acc.id, pending.proxy_url.clone());
+    } else if acc.proxy_url.trim().is_empty() {
+        if let Some((_, url)) = app.proxy_pool.next_assignment() {
+            let _ = app.kiro_pool.set_proxy(&acc.id, url);
+        }
+    }
+
+    info!(account = %acc.id, email = %acc.email, "kiro account added via enterprise sso");
+    let now = chrono::Utc::now();
+    let fresh = app.kiro_pool.get(&acc.id).unwrap_or(acc);
+    let view = account_view(&app, fresh, now);
+    Json(json!({"ok": true, "account": view})).into_response()
+}
+
 // ===== 统计 =====
 
 #[derive(Serialize)]

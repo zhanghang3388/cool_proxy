@@ -72,6 +72,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/kiro/accounts/:id/proxy", put(kiro_accounts::set_proxy))
         .route("/kiro/stats", get(kiro_accounts::stats))
+        .route("/kiro/login/start", post(kiro_accounts::sso_login_start))
+        .route("/kiro/login/finish", post(kiro_accounts::sso_login_finish))
         // ===== Claude 账号池 =====
         .route("/claude/accounts", get(claude_accounts::list))
         .route(
