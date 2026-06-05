@@ -318,7 +318,20 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
                         acc = fresh;
                     }
                 }
-                Err(e) => tracing::warn!(account = %id, "查额度前刷新 token 失败: {e:#}"),
+                Err(e) => {
+                    // token 已过期且刷新失败：直接把刷新错误暴露出来，而不是拿着死 token
+                    // 去查额度得到误导性的 "bearer token invalid"。
+                    let msg = format!("token 刷新失败（查额度前）: {e:#}");
+                    tracing::warn!(account = %id, "{msg}");
+                    app.kiro_pool.update_quota_error(&id, &msg);
+                    let usage = app.kiro_pool.get(&id).map(|a| usage_view(&a));
+                    return QuotaRefreshItem {
+                        id,
+                        ok: false,
+                        usage,
+                        error: Some(msg),
+                    };
+                }
             }
         }
     }
