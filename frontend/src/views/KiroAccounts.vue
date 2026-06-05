@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch, type VNode } from 'vue'
 import {
-  NCard, NDataTable, NSpace, NButton, NTag, NUpload, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
-  NSelect, NInput, NPagination, NModal, NAlert, NProgress,
+  NCard, NSpace, NButton, NTag, NUpload, NPopconfirm, NStatistic, NGrid, NGi, NSwitch,
+  NSelect, NInput, NPagination, NModal, NAlert, NProgress, NSpin, NEmpty,
   useMessage,
-  type DataTableColumns,
   type UploadFileInfo,
 } from 'naive-ui'
 import {
@@ -143,160 +142,64 @@ function renderUsage(row: KiroAccountView) {
   })
 }
 
-const columns = computed<DataTableColumns<KiroAccountView>>(() => [
-  { title: '邮箱', key: 'email', minWidth: 200, ellipsis: { tooltip: true } },
-  {
-    title: '登录方式',
-    key: 'login_provider',
-    width: 110,
-    render: (row) => {
-      const p = row.login_provider ?? (row.auth_method === 'idc' ? 'IdC' : '-')
-      return h(NTag, { size: 'small' }, { default: () => p })
-    },
-  },
-  {
-    title: '套餐',
-    key: 'plan',
-    width: 110,
-    ellipsis: { tooltip: true },
-    render: (row) => row.usage?.plan_name ?? '-',
-  },
-  {
-    title: '额度',
-    key: 'usage',
-    width: 240,
-    render: renderUsage,
-  },
-  {
-    title: '状态',
-    key: 'status',
-    width: 150,
-    render: (row) => {
-      const tags: ReturnType<typeof h>[] = []
-      if (!row.enabled) {
-        tags.push(h(NTag, { type: 'default', size: 'small' }, { default: () => '禁用' }))
-      } else if (row.status === 'banned') {
-        tags.push(h(NTag, { type: 'error', size: 'small', title: row.status_reason ?? '' }, { default: () => '封禁' }))
-      } else if (row.cooldown_until && new Date(row.cooldown_until) > new Date()) {
-        tags.push(h(NTag, { type: 'warning', size: 'small' }, { default: () => '冷却中' }))
-      } else if (row.expired) {
-        tags.push(h(NTag, { type: 'error', size: 'small' }, { default: () => '已过期' }))
-      } else {
-        tags.push(h(NTag, { type: 'success', size: 'small' }, { default: () => '可用' }))
-      }
-      return h(NSpace, { size: 4 }, { default: () => tags })
-    },
-  },
-  {
-    title: '到期时间',
-    key: 'expire_at',
-    width: 170,
-    render: (row) => fmtTime(row.expire_at),
-  },
-  {
-    title: '代理',
-    key: 'proxy',
-    width: 220,
-    render: (row) => {
-      const opts = [
-        { label: '直连', value: '__direct__' },
-        ...proxies.value.map((p) => ({
-          label: p.label ? `${p.label} (${p.url})` : p.url,
-          value: p.id,
-        })),
-      ]
-      const known = !row.proxy_url || row.proxy_id !== null
-      if (!known) {
-        opts.push({ label: `自定义 (${row.proxy_url})`, value: '__custom__' })
-      }
-      const value = !row.proxy_url ? '__direct__' : row.proxy_id ?? '__custom__'
-      return h(NSelect, {
-        value,
-        options: opts,
-        size: 'small',
-        consistentMenuWidth: false,
-        'onUpdate:value': async (v: string) => {
-          if (v === '__custom__') return
-          try {
-            if (v === '__direct__') {
-              await setKiroAccountProxy(row.id, { proxy_id: '' })
-            } else {
-              await setKiroAccountProxy(row.id, { proxy_id: v })
-            }
-            message.success('已更新代理')
-            await refresh()
-          } catch (e) {
-            message.error((e as Error).message)
-          }
-        },
-      })
-    },
-  },
-  {
-    title: '最近刷新',
-    key: 'last_refresh_at',
-    width: 170,
-    render: (row) => fmtTime(row.last_refresh_at),
-  },
-  {
-    title: '请求 / 失败',
-    key: 'reqfail',
-    width: 110,
-    render: (row) => `${row.total_requests} / ${row.total_failures}`,
-  },
-  {
-    title: '最近错误',
-    key: 'last_error',
-    minWidth: 200,
-    ellipsis: { tooltip: true },
-    render: (row) => row.last_error ?? '-',
-  },
-  {
-    title: '启用',
-    key: 'enabled',
-    width: 80,
-    render: (row) =>
-      h(NSwitch, {
-        value: row.enabled,
-        size: 'small',
-        'onUpdate:value': async (v: boolean) => {
-          try {
-            await patchKiroAccount(row.id, { enabled: v })
-            row.enabled = v
-            message.success(v ? '已启用' : '已禁用')
-          } catch (e) {
-            message.error(`操作失败：${(e as Error).message}`)
-          }
-        },
-      }),
-  },
-  {
-    title: '操作',
-    key: 'actions',
-    width: 300,
-    render: (row) =>
-      h(NSpace, { size: 4 }, {
-        default: () => [
-          h(NButton, { size: 'small', onClick: () => doRefresh(row.id) }, { default: () => '刷新 token' }),
-          h(
-            NButton,
-            { size: 'small', loading: !!quotaLoading.value[row.id], onClick: () => doRefreshQuota(row.id) },
-            { default: () => '刷新额度' },
-          ),
-          h(NButton, { size: 'small', onClick: () => doResetCooldown(row.id) }, { default: () => '清除冷却' }),
-          h(
-            NPopconfirm,
-            { onPositiveClick: () => doDelete(row.id) },
-            {
-              default: () => '确定删除该账号？',
-              trigger: () =>
-                h(NButton, { size: 'small', type: 'error', ghost: true }, { default: () => '删除' }),
-            },
-          ),
-        ],
-      }),
-  },
-])
+// 把 renderUsage 产出的 vnode 直接渲染到模板（卡片里复用表格时期的额度渲染逻辑）。
+const RenderVNode = (props: { vnode: VNode | null }) => props.vnode
+
+function statusInfo(row: KiroAccountView): {
+  type: 'default' | 'error' | 'warning' | 'success'
+  label: string
+  title?: string
+} {
+  if (!row.enabled) return { type: 'default', label: '禁用' }
+  if (row.status === 'banned') return { type: 'error', label: '封禁', title: row.status_reason ?? '' }
+  if (row.cooldown_until && new Date(row.cooldown_until) > new Date()) {
+    return { type: 'warning', label: '冷却中' }
+  }
+  if (row.expired) return { type: 'error', label: '已过期' }
+  return { type: 'success', label: '可用' }
+}
+
+function providerLabel(row: KiroAccountView): string {
+  return row.login_provider ?? (row.auth_method === 'idc' ? 'IdC' : '-')
+}
+
+function proxyOptionsFor(row: KiroAccountView) {
+  const opts = [
+    { label: '直连', value: '__direct__' },
+    ...proxies.value.map((p) => ({
+      label: p.label ? `${p.label} (${p.url})` : p.url,
+      value: p.id,
+    })),
+  ]
+  const known = !row.proxy_url || row.proxy_id !== null
+  if (!known) opts.push({ label: `自定义 (${row.proxy_url})`, value: '__custom__' })
+  return opts
+}
+
+function proxyValue(row: KiroAccountView): string {
+  return !row.proxy_url ? '__direct__' : (row.proxy_id ?? '__custom__')
+}
+
+async function onProxyChange(row: KiroAccountView, v: string) {
+  if (v === '__custom__') return
+  try {
+    await setKiroAccountProxy(row.id, { proxy_id: v === '__direct__' ? '' : v })
+    message.success('已更新代理')
+    await refresh()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+async function onToggleEnabled(row: KiroAccountView, v: boolean) {
+  try {
+    await patchKiroAccount(row.id, { enabled: v })
+    row.enabled = v
+    message.success(v ? '已启用' : '已禁用')
+  } catch (e) {
+    message.error(`操作失败：${(e as Error).message}`)
+  }
+}
 
 async function doRefresh(id: string) {
   try {
@@ -557,14 +460,82 @@ async function copySsoUrl() {
           <n-button @click="() => refresh({ autoQuota: true })" :loading="loading">手动刷新</n-button>
         </n-space>
       </template>
-      <n-data-table
-        :columns="columns"
-        :data="accounts"
-        :bordered="false"
-        :row-key="(row: KiroAccountView) => row.id"
-        :scroll-x="1850"
-        size="small"
-      />
+      <n-spin :show="loading">
+        <n-empty
+          v-if="!accounts.length"
+          description="暂无账号，点击右上角导入 / 企业 SSO 登录"
+          style="padding: 40px 0"
+        />
+        <n-grid v-else responsive="screen" cols="1 s:1 m:2 l:3 xl:3" :x-gap="12" :y-gap="12">
+          <n-gi v-for="row in accounts" :key="row.id">
+            <n-card size="small" :bordered="true" class="acc-card">
+              <!-- 头部：邮箱 + 登录方式 + 状态 + 启用开关 -->
+              <div class="acc-head">
+                <div class="acc-title" :title="row.email || row.id">
+                  <span class="acc-email">{{ row.email || row.id }}</span>
+                  <n-tag size="small" round>{{ providerLabel(row) }}</n-tag>
+                  <n-tag :type="statusInfo(row).type" size="small" round :title="statusInfo(row).title">
+                    {{ statusInfo(row).label }}
+                  </n-tag>
+                </div>
+                <n-switch
+                  :value="row.enabled"
+                  size="small"
+                  @update:value="(v: boolean) => onToggleEnabled(row, v)"
+                />
+              </div>
+              <div class="acc-org" v-if="row.usage?.plan_name">套餐：{{ row.usage.plan_name }}</div>
+
+              <!-- 额度（复用表格时期的 renderUsage） -->
+              <div class="quota-wrap">
+                <render-v-node :vnode="renderUsage(row)" />
+              </div>
+
+              <!-- 元信息 -->
+              <div class="meta-grid">
+                <div class="meta-item"><span class="meta-k">到期</span><span class="meta-v">{{ fmtTime(row.expire_at) }}</span></div>
+                <div class="meta-item"><span class="meta-k">最近刷新</span><span class="meta-v">{{ fmtTime(row.last_refresh_at) }}</span></div>
+                <div class="meta-item"><span class="meta-k">请求 / 失败</span><span class="meta-v">{{ row.total_requests }} / {{ row.total_failures }}</span></div>
+              </div>
+
+              <div class="proxy-row">
+                <span class="meta-k">代理</span>
+                <n-select
+                  :value="proxyValue(row)"
+                  :options="proxyOptionsFor(row)"
+                  size="small"
+                  :consistent-menu-width="false"
+                  @update:value="(v: string) => onProxyChange(row, v)"
+                />
+              </div>
+
+              <div class="acc-err" v-if="row.last_error" :title="row.last_error">
+                最近错误：{{ row.last_error }}
+              </div>
+
+              <template #action>
+                <n-space :size="6">
+                  <n-button
+                    size="small"
+                    type="primary"
+                    ghost
+                    :loading="!!quotaLoading[row.id]"
+                    @click="doRefreshQuota(row.id)"
+                  >刷新额度</n-button>
+                  <n-button size="small" @click="doRefresh(row.id)">刷新 token</n-button>
+                  <n-button size="small" @click="doResetCooldown(row.id)">清除冷却</n-button>
+                  <n-popconfirm @positive-click="() => doDelete(row.id)">
+                    <template #trigger>
+                      <n-button size="small" type="error" ghost>删除</n-button>
+                    </template>
+                    确定删除该账号？
+                  </n-popconfirm>
+                </n-space>
+              </template>
+            </n-card>
+          </n-gi>
+        </n-grid>
+      </n-spin>
       <div style="margin-top: 12px; display: flex; justify-content: flex-end">
         <n-pagination
           v-model:page="page"
@@ -712,5 +683,72 @@ async function copySsoUrl() {
   margin-bottom: 6px;
   color: #909399;
   font-size: 13px;
+}
+
+/* ===== 账号卡片 ===== */
+.acc-card {
+  height: 100%;
+}
+.acc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.acc-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.acc-email {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.acc-org {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #909399;
+}
+.quota-wrap {
+  margin: 12px 0;
+}
+.meta-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+.meta-item {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+}
+.meta-k {
+  color: #909399;
+  flex-shrink: 0;
+}
+.meta-v {
+  color: #303133;
+}
+.proxy-row {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.proxy-row :deep(.n-select) {
+  flex: 1;
+}
+.acc-err {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #d03050;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
