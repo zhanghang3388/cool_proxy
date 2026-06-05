@@ -303,7 +303,10 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
         };
     };
 
-    let Some(profile_arn) = acc.profile_arn.clone() else {
+    // 没有显式 profile_arn 时按登录方式兜底（与上游转发 resolve_profile_arn 一致：
+    // social → social ARN，idc/企业 → Builder-ID ARN），否则 IdC 账号永远查不了额度。
+    let profile_arn = crate::pool::kiro::resolve_profile_arn(&acc);
+    if profile_arn.trim().is_empty() {
         let msg = "缺少 profile_arn，无法查询额度".to_string();
         app.kiro_pool.update_quota_error(&id, &msg);
         let usage = app.kiro_pool.get(&id).map(|a| usage_view(&a));
@@ -313,7 +316,7 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
             usage,
             error: Some(msg),
         };
-    };
+    }
 
     let result = fetch_kiro_usage(
         &app.clients,
