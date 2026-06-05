@@ -294,7 +294,7 @@ fn quota_update_from_snapshot(snapshot: KiroUsageSnapshot) -> KiroQuotaUpdate {
 }
 
 async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
-    let Some(acc) = app.kiro_pool.get(&id) else {
+    let Some(mut acc) = app.kiro_pool.get(&id) else {
         return QuotaRefreshItem {
             id,
             ok: false,
@@ -302,6 +302,26 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
             error: Some("account not found".to_string()),
         };
     };
+
+    // 查额度前先确保 access_token 新鲜：过期/将过期的 token 会被上游判为
+    // "bearer token invalid"（与 Kiro-account-manager 一致——用前先刷新）。
+    let stale = acc
+        .expires_at
+        .map(|e| e <= chrono::Utc::now() + chrono::Duration::seconds(60))
+        .unwrap_or(true);
+    if stale && !acc.refresh_token.is_empty() {
+        if let Some(_guard) = app.kiro_refresher.begin_refresh(&id) {
+            match app.kiro_refresher.refresh(&acc).await {
+                Ok(update) => {
+                    app.kiro_pool.update_after_refresh(&id, &update);
+                    if let Some(fresh) = app.kiro_pool.get(&id) {
+                        acc = fresh;
+                    }
+                }
+                Err(e) => tracing::warn!(account = %id, "查额度前刷新 token 失败: {e:#}"),
+            }
+        }
+    }
 
     // 没有显式 profile_arn 时按登录方式兜底（与上游转发 resolve_profile_arn 一致：
     // social → social ARN，idc/企业 → Builder-ID ARN），否则 IdC 账号永远查不了额度。
@@ -320,6 +340,7 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
 
     let result = fetch_kiro_usage(
         &app.clients,
+        &acc.id,
         &acc.access_token,
         &profile_arn,
         acc.idc_region.as_deref(),

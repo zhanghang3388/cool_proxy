@@ -8,7 +8,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::auth::kiro::{
     get_path_value, normalize_non_empty, parse_profile_arn_region, parse_timestamp, pick_number,
@@ -16,11 +15,30 @@ use crate::auth::kiro::{
 };
 use crate::proxy::ProxiedClients;
 
-/// 额度查询的 KiroIDE 客户端标识（aws-sdk-js 风格，与 Kiro-account-manager 一致）。
-/// CodeWhisperer 边缘要求请求带可识别的 aws-sdk 客户端 UA，缺失会让 token 被判无效。
-const KIRO_USAGE_USER_AGENT: &str = "aws-sdk-js/1.0.34 ua/2.1 os/win32#10.0.19045 lang/js \
-     md/nodejs#22.22.0 api/codewhispererruntime#1.0.34 m/E KiroIDE-0.12.155";
-const KIRO_USAGE_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.34 KiroIDE-0.12.155";
+/// KiroIDE 版本号（拼进 user-agent，与官方 / Kiro-account-manager 对齐）。
+const KIRO_IDE_VERSION: &str = "0.12.155";
+
+/// 额度查询客户端标识，逐字对齐 Kiro-account-manager 的 getUsageLimits：`User-Agent` /
+/// `x-amz-user-agent` 都带账号稳定 machineId。CodeWhisperer 边缘要求可识别的 aws-sdk
+/// 客户端，缺失这些头会让 token 被判 "bearer token invalid"。
+fn kiro_usage_user_agent(machine_id: &str) -> String {
+    format!(
+        "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 \
+         api/codewhispererstreaming#1.0.18 m/E KiroIDE-{KIRO_IDE_VERSION}-{machine_id}"
+    )
+}
+
+fn kiro_usage_amz_user_agent(machine_id: &str) -> String {
+    format!("aws-sdk-js/1.0.18 KiroIDE {KIRO_IDE_VERSION} {machine_id}")
+}
+
+/// 账号稳定 machineId：sha256("kiro-device-{id}")，与 Kiro-account-manager 一致。
+fn stable_machine_id(account_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::default();
+    h.update(format!("kiro-device-{account_id}").as_bytes());
+    hex::encode(h.finalize())
+}
 
 /// 一次额度查询的结构化结果。
 #[derive(Debug, Clone, Default)]
@@ -41,6 +59,7 @@ pub struct KiroUsageSnapshot {
 /// 上游返回 403 / 带封禁原因时，返回 `Err("BANNED:<reason>")`，调用方据此标记账号。
 pub async fn fetch_kiro_usage(
     clients: &Arc<ProxiedClients>,
+    account_id: &str,
     access_token: &str,
     profile_arn: &str,
     idc_region: Option<&str>,
@@ -58,31 +77,24 @@ pub async fn fetch_kiro_usage(
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty())
         .or_else(|| parse_profile_arn_region(profile_arn));
-    let endpoint = runtime_endpoint_for_region(region.as_deref());
-    let url = format!("{}/getUsageLimits", endpoint.trim_end_matches('/'));
+    let primary = runtime_endpoint_for_region(region.as_deref());
+    // 403 视为区域不对（不是封禁），回退另一个区域端点——与 Kiro-account-manager 一致。
+    let fallback = if primary.contains("eu-central-1") {
+        "https://q.us-east-1.amazonaws.com"
+    } else {
+        "https://q.eu-central-1.amazonaws.com"
+    };
 
+    let machine_id = stable_machine_id(account_id);
     let http = clients.get(proxy_url)?;
-    let resp = http
-        .get(&url)
-        .timeout(Duration::from_secs(30))
-        .query(&[
-            ("origin", "AI_EDITOR"),
-            ("profileArn", profile_arn),
-            ("resourceType", "AGENTIC_REQUEST"),
-            ("isEmailRequired", "true"),
-        ])
-        .header("Accept", "application/json")
-        .header("user-agent", KIRO_USAGE_USER_AGENT)
-        .header("x-amz-user-agent", KIRO_USAGE_AMZ_USER_AGENT)
-        .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", access_token.trim()))
-        .send()
-        .await
-        .with_context(|| "kiro usage request")?;
 
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let (status, body) =
+        send_usage(&http, &primary, profile_arn, access_token, &machine_id).await?;
+    let (status, body) = if status == reqwest::StatusCode::FORBIDDEN {
+        send_usage(&http, fallback, profile_arn, access_token, &machine_id).await?
+    } else {
+        (status, body)
+    };
 
     if !status.is_success() {
         let reason = parse_runtime_error_reason(&body);
@@ -99,6 +111,37 @@ pub async fn fetch_kiro_usage(
 
     let usage: Value = serde_json::from_str(&body).with_context(|| "parse kiro usage response")?;
     Ok(parse_usage_snapshot(usage))
+}
+
+/// 向某个区域端点发起一次 getUsageLimits，返回 (status, body)。逐字对齐
+/// Kiro-account-manager 的 `fetchRestApi`：只带 Accept / Authorization / UA 两件套。
+async fn send_usage(
+    http: &reqwest::Client,
+    endpoint: &str,
+    profile_arn: &str,
+    access_token: &str,
+    machine_id: &str,
+) -> Result<(reqwest::StatusCode, String)> {
+    let url = format!("{}/getUsageLimits", endpoint.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .timeout(Duration::from_secs(30))
+        .query(&[
+            ("origin", "AI_EDITOR"),
+            ("resourceType", "AGENTIC_REQUEST"),
+            ("isEmailRequired", "true"),
+            ("profileArn", profile_arn),
+        ])
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", access_token.trim()))
+        .header("User-Agent", kiro_usage_user_agent(machine_id))
+        .header("x-amz-user-agent", kiro_usage_amz_user_agent(machine_id))
+        .send()
+        .await
+        .with_context(|| "kiro usage request")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    Ok((status, body))
 }
 
 /// 判断上游错误原因是否为封禁/停用类（区分真封号 vs 认证/限流等可恢复错误）。
