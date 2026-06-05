@@ -322,6 +322,7 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
         &app.clients,
         &acc.access_token,
         &profile_arn,
+        acc.idc_region.as_deref(),
         &acc.proxy_url,
     )
     .await;

@@ -8,12 +8,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::auth::kiro::{
     get_path_value, normalize_non_empty, parse_profile_arn_region, parse_timestamp, pick_number,
     pick_string, runtime_endpoint_for_region,
 };
 use crate::proxy::ProxiedClients;
+
+/// 额度查询的 KiroIDE 客户端标识（aws-sdk-js 风格，与 Kiro-account-manager 一致）。
+/// CodeWhisperer 边缘要求请求带可识别的 aws-sdk 客户端 UA，缺失会让 token 被判无效。
+const KIRO_USAGE_USER_AGENT: &str = "aws-sdk-js/1.0.34 ua/2.1 os/win32#10.0.19045 lang/js \
+     md/nodejs#22.22.0 api/codewhispererruntime#1.0.34 m/E KiroIDE-0.12.155";
+const KIRO_USAGE_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.34 KiroIDE-0.12.155";
 
 /// 一次额度查询的结构化结果。
 #[derive(Debug, Clone, Default)]
@@ -36,6 +43,7 @@ pub async fn fetch_kiro_usage(
     clients: &Arc<ProxiedClients>,
     access_token: &str,
     profile_arn: &str,
+    idc_region: Option<&str>,
     proxy_url: &str,
 ) -> Result<KiroUsageSnapshot> {
     if access_token.trim().is_empty() {
@@ -45,7 +53,11 @@ pub async fn fetch_kiro_usage(
         anyhow::bail!("missing profile_arn（无法定位 Kiro runtime endpoint）");
     }
 
-    let region = parse_profile_arn_region(profile_arn);
+    // 端点优先按账号自身 region（idc_region）选择，否则回退到 profile_arn 里的 region。
+    let region = idc_region
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| parse_profile_arn_region(profile_arn));
     let endpoint = runtime_endpoint_for_region(region.as_deref());
     let url = format!("{}/getUsageLimits", endpoint.trim_end_matches('/'));
 
@@ -60,6 +72,10 @@ pub async fn fetch_kiro_usage(
             ("isEmailRequired", "true"),
         ])
         .header("Accept", "application/json")
+        .header("user-agent", KIRO_USAGE_USER_AGENT)
+        .header("x-amz-user-agent", KIRO_USAGE_AMZ_USER_AGENT)
+        .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", access_token.trim()))
         .send()
         .await
@@ -69,20 +85,37 @@ pub async fn fetch_kiro_usage(
     let body = resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        if let Some(reason) = parse_runtime_error_reason(&body)
-            .or_else(|| (status == reqwest::StatusCode::FORBIDDEN).then(|| body.clone()))
-        {
-            anyhow::bail!("BANNED:{}", reason);
+        let reason = parse_runtime_error_reason(&body);
+        // 仅当原因确实是封禁/停用类才标 BANNED；401 / “bearer token invalid” 这类是
+        // 认证错误（可刷新/可恢复），不应禁用账号——之前对任何错误一律标 BANNED 是误判。
+        if let Some(r) = reason.as_deref() {
+            if looks_like_ban(r) {
+                anyhow::bail!("BANNED:{}", r);
+            }
         }
-        anyhow::bail!(
-            "kiro usage request failed: {} {}",
-            status,
-            body.chars().take(512).collect::<String>()
-        );
+        let detail = reason.unwrap_or_else(|| body.chars().take(512).collect::<String>());
+        anyhow::bail!("kiro usage request failed: {} {}", status, detail);
     }
 
     let usage: Value = serde_json::from_str(&body).with_context(|| "parse kiro usage response")?;
     Ok(parse_usage_snapshot(usage))
+}
+
+/// 判断上游错误原因是否为封禁/停用类（区分真封号 vs 认证/限流等可恢复错误）。
+fn looks_like_ban(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    [
+        "suspend",
+        "banned",
+        "improper",
+        "violat",
+        "abuse",
+        "fraud",
+        "disabled",
+        "terminated",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
 }
 
 fn parse_usage_snapshot(usage: Value) -> KiroUsageSnapshot {
