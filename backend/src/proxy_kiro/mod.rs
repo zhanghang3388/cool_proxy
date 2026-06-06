@@ -54,33 +54,37 @@ pub async fn models_handler(State(app): State<Arc<AppState>>, req: Request) -> R
         return anthropic_error(StatusCode::UNAUTHORIZED, "missing or invalid api key");
     }
     let now = chrono::Utc::now().timestamp() as u64;
-    // KAM `get_available_models` 同步：21 个模型 + auto。
-    // 数据来源：Kiro 官方 ListAvailableModels API 实际返回的全集合。
+    // 仅返回 Claude 系列，且 id 用「横杠」形式（claude-opus-4-8，而非 4.8）。
+    //
+    // 原因：本清单主要给上游网关（如 cool_api）做「获取模型 / allowed_models 登记」用。
+    // Claude Code 默认就发横杠形式的模型名（claude-opus-4-8 / claude-sonnet-4-5-20250929
+    // / claude-3-5-haiku-20241022），网关按精确字符串匹配，清单与 CC 实发名一致才不会
+    // 被网关在转发前就 400 掉。cool_proxy 自己的 /v1/messages 对横杠/点号都认（map_model_id
+    // 会归一），所以这里统一横杠不影响实际对话。
+    //
+    // 末尾特意带上 CC 的后台「小模型」claude-3-5-haiku-20241022 —— 它不在 Kiro 官方清单里，
+    // 但 CC 会用它发标题/摘要类请求；列进来，网关侧才能一次把主模型 + 小模型都登记全。
+    // 不再返回 auto / 开源模型（deepseek / minimax / glm / qwen）—— 按需仅暴露 Claude。
     const MODEL_IDS: &[&str] = &[
-        "auto",
-        // Claude 系列
-        "claude-opus-4.8",
-        "claude-opus-4.8-thinking",
-        "claude-opus-4.7",
-        "claude-opus-4.7-thinking",
-        "claude-opus-4.6",
-        "claude-opus-4.6-thinking",
-        "claude-sonnet-4.6",
-        "claude-sonnet-4.6-thinking",
-        "claude-opus-4.5",
-        "claude-opus-4.5-thinking",
-        "claude-sonnet-4.5",
-        "claude-sonnet-4.5-thinking",
-        "claude-haiku-4.5",
-        "claude-haiku-4.5-thinking",
+        "claude-opus-4-8",
+        "claude-opus-4-8-thinking",
+        "claude-opus-4-7",
+        "claude-opus-4-7-thinking",
+        "claude-opus-4-6",
+        "claude-opus-4-6-thinking",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-6-thinking",
+        "claude-opus-4-5",
+        "claude-opus-4-5-thinking",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-thinking",
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-thinking",
         "claude-sonnet-4",
         "claude-sonnet-4-thinking",
-        // 开源
-        "deepseek-3.2",
-        "minimax-m2.5",
-        "minimax-m2.1",
-        "glm-5",
-        "qwen3-coder-next",
+        // Claude Code 后台小模型（不在 Kiro 清单内，列出便于网关登记；
+        // 实际转发时 map_model_id 会归一到 claude-haiku-4.5）。
+        "claude-3-5-haiku-20241022",
     ];
     let data: Vec<Value> = MODEL_IDS
         .iter()
