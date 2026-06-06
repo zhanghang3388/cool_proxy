@@ -42,6 +42,8 @@ pub struct SelectedKiroAccount {
     pub provider: String,
     pub auth_method: String,
     pub machine_id: Option<String>,
+    /// 账号关联的 region（IdC 必填，social 可空）。给反代选 q.{region}.amazonaws.com 用。
+    pub idc_region: Option<String>,
     pub proxy_url: String,
 }
 
@@ -163,6 +165,7 @@ impl KiroPool {
                 provider: a.provider,
                 auth_method: a.auth_method,
                 machine_id: a.machine_id,
+                idc_region: a.idc_region,
                 proxy_url: a.proxy_url,
             });
         }

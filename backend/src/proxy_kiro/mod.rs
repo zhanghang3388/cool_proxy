@@ -137,14 +137,28 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
             "kiro forwarding"
         );
 
-        // 依次尝试端点
+        // 依次尝试端点：先打账号自身 region，然后兜底列表（去重）。
+        // 之前硬编码 us-east-1 的 CodeWhisperer/AmazonQ 双端点会让企业号 region 错位时
+        // 持续 403 —— 与 KAM 一致：URL 由账号 region 决定。
+        let primary_region = upstream::resolve_account_region(
+            selected.profile_arn.as_deref(),
+            selected.idc_region.as_deref(),
+        );
+        let mut endpoints_tried: Vec<String> = Vec::with_capacity(5);
+        endpoints_tried.push(primary_region.clone());
+        for ep in upstream::KIRO_FALLBACK_ENDPOINTS {
+            if !endpoints_tried.iter().any(|r| r == ep.region) {
+                endpoints_tried.push(ep.region.to_string());
+            }
+        }
+
         let mut endpoint_resp = None;
         let mut endpoint_err: Option<String> = None;
         let mut auth_failed = false;
-        for endpoint in upstream::KIRO_ENDPOINTS {
+        for region in &endpoints_tried {
             match upstream::call_kiro(
                 &app.clients,
-                endpoint,
+                region,
                 &translated.payload,
                 &selected.access_token,
                 &selected.auth_method,
@@ -166,15 +180,16 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
                         handle_auth_error(&app, &selected.id, code, &snippet);
                         auth_failed = true;
                         endpoint_err =
-                            Some(format!("upstream {code} on {}: {snippet}", endpoint.name));
+                            Some(format!("upstream {code} on q.{region}.amazonaws.com: {snippet}"));
                         break;
                     }
                     // 429 / 其它：记下来换下一个端点再试
-                    endpoint_err = Some(format!("upstream {code} on {}: {snippet}", endpoint.name));
+                    endpoint_err =
+                        Some(format!("upstream {code} on q.{region}.amazonaws.com: {snippet}"));
                     continue;
                 }
                 Err(e) => {
-                    endpoint_err = Some(format!("network on {}: {e}", endpoint.name));
+                    endpoint_err = Some(format!("network on q.{region}.amazonaws.com: {e}"));
                     continue;
                 }
             }
