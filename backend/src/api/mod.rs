@@ -70,7 +70,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/kiro/accounts/:id/reset-cooldown",
             post(kiro_accounts::reset_cooldown),
         )
-        .route("/kiro/accounts/:id/proxy", put(kiro_accounts::set_proxy))
+        .route(
+            "/kiro/accounts/:id/proxy",
+            put(kiro_accounts::set_proxy),
+        )
+        .route(
+            "/kiro/accounts/:id/models",
+            get(kiro_accounts::account_models),
+        )
         .route("/kiro/stats", get(kiro_accounts::stats))
         .route("/kiro/login/start", post(kiro_accounts::sso_login_start))
         .route("/kiro/login/finish", post(kiro_accounts::sso_login_finish))

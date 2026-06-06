@@ -20,6 +20,9 @@ use tracing::info;
 use crate::auth::kiro::{
     auth_method_for_provider, KiroTokenData, KIRO_PROVIDER_BUILDER_ID, KIRO_PROVIDER_ENTERPRISE,
 };
+use crate::auth::kiro_models::{
+    build_cache_entry, fetch_all_available_models, read_models_cache, ListModelsQuery,
+};
 use crate::auth::kiro_quota::{
     banned_reason, fetch_kiro_usage, is_auth_error_message as is_quota_auth_error,
     KiroUsageSnapshot, UsageQuery,
@@ -493,6 +496,197 @@ pub async fn refresh_quotas(
         .collect::<Vec<_>>()
         .await;
     Json(QuotaRefreshResp { items }).into_response()
+}
+
+// ===== 账号实际可用模型（诊断用，调用方为管理面板）=====
+//
+// 客户端 GET /kiro/v1/models 永远返回 Kiro 官方维护的全集（21 个模型，与 KAM 对齐），
+// 不打上游 —— 高频访问、所有账号都一样、订阅差异由 messages 调用时上游自然拒绝处理。
+// 这里的 /api/kiro/accounts/<id>/models 是**诊断接口**：去打上游 ListAvailableModels
+// 看某个具体账号当前订阅实际开了哪些模型，结果 30 分钟缓存到该账号上。
+
+#[derive(Deserialize, Default)]
+pub struct AccountModelsQuery {
+    /// 强制重新拉取上游，绕过 30 分钟缓存。
+    #[serde(default)]
+    pub force: Option<bool>,
+    /// 按 modelProvider 过滤（KAM 单页参数：anthropic / openai / ...）。
+    #[serde(default)]
+    pub model_provider: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AccountModelsResp {
+    pub id: String,
+    pub provider: String,
+    pub region: Option<String>,
+    pub from_cache: bool,
+    pub cached_at: Option<String>,
+    pub default_model_id: Option<String>,
+    pub models: Vec<Value>,
+}
+
+pub async fn account_models(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<AccountModelsQuery>,
+) -> Response {
+    let Some(mut acc) = app.kiro_pool.get(&id) else {
+        return (StatusCode::NOT_FOUND, "account not found").into_response();
+    };
+
+    let force = q.force.unwrap_or(false);
+    let model_provider = q
+        .model_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // 1) 缓存命中且非强刷 —— 直接返回。
+    if !force {
+        if let Some(resp) = read_models_cache(&acc.models_cache, model_provider, false) {
+            // 缓存里只存了 response 主体，cached_at 单独从 models_cache JSON 里读。
+            let cached_at = acc
+                .models_cache
+                .get("cachedAt")
+                .or_else(|| acc.models_cache.get("cached_at"))
+                .and_then(|v| v.as_i64())
+                .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+                .map(|t| t.to_rfc3339());
+            return Json(AccountModelsResp {
+                id,
+                provider: acc.provider,
+                region: acc.idc_region,
+                from_cache: true,
+                cached_at,
+                default_model_id: resp.default_model.as_ref().map(|m| m.model_id.clone()),
+                models: resp
+                    .available_models
+                    .iter()
+                    .map(model_to_view)
+                    .collect(),
+            })
+            .into_response();
+        }
+    }
+
+    // 2) 查上游前先确保 token 新鲜（与查额度路径一致）。
+    let stale = acc
+        .expires_at
+        .map(|e| e <= chrono::Utc::now() + chrono::Duration::seconds(60))
+        .unwrap_or(true);
+    if stale && !acc.refresh_token.is_empty() {
+        if let Some(_guard) = app.kiro_refresher.begin_refresh(&id) {
+            match app.kiro_refresher.refresh(&acc).await {
+                Ok(update) => {
+                    app.kiro_pool.update_after_refresh(&id, &update);
+                    if let Some(fresh) = app.kiro_pool.get(&id) {
+                        acc = fresh;
+                    }
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("token refresh failed: {e:#}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    // 3) 真去打 ListAvailableModels。401 自动 refresh + 重试一次；403 + suspended 标 banned。
+    let mut access_token = acc.access_token.clone();
+    let mut profile_arn = acc.profile_arn.clone();
+    let mut idc_region = acc.idc_region.clone();
+    let mut machine_id = acc.machine_id.clone();
+    let mut last_err: Option<String> = None;
+
+    for attempt in 0..2u32 {
+        let res = fetch_all_available_models(
+            &app.clients,
+            ListModelsQuery {
+                access_token: &access_token,
+                provider: &acc.provider,
+                idc_region: idc_region.as_deref(),
+                profile_arn: profile_arn.as_deref(),
+                machine_id: machine_id.as_deref(),
+                model_provider,
+                proxy_url: &acc.proxy_url,
+            },
+        )
+        .await;
+
+        match res {
+            Ok(resp) => {
+                let entry = build_cache_entry(&resp, model_provider);
+                app.kiro_pool.update_models_cache(&id, &entry);
+                return Json(AccountModelsResp {
+                    id: acc.id.clone(),
+                    provider: acc.provider.clone(),
+                    region: idc_region.clone(),
+                    from_cache: false,
+                    cached_at: Some(chrono::Utc::now().to_rfc3339()),
+                    default_model_id: resp.default_model.as_ref().map(|m| m.model_id.clone()),
+                    models: resp.available_models.iter().map(model_to_view).collect(),
+                })
+                .into_response();
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                last_err = Some(msg.clone());
+                if attempt == 0 && msg.contains("AUTH_ERROR:") {
+                    if let Some(_guard) = app.kiro_refresher.begin_refresh(&id) {
+                        if let Ok(update) = app.kiro_refresher.refresh(&acc).await {
+                            app.kiro_pool.update_after_refresh(&id, &update);
+                            if let Some(fresh) = app.kiro_pool.get(&id) {
+                                acc = fresh;
+                                access_token = acc.access_token.clone();
+                                profile_arn = acc.profile_arn.clone();
+                                idc_region = acc.idc_region.clone();
+                                machine_id = acc.machine_id.clone();
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if msg.contains("BANNED:") {
+                    let reason = msg
+                        .split("BANNED:")
+                        .nth(1)
+                        .map(str::trim)
+                        .unwrap_or("suspended")
+                        .to_string();
+                    app.kiro_pool.mark_banned(&id, &reason);
+                }
+                break;
+            }
+        }
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        last_err.unwrap_or_else(|| "ListAvailableModels failed".to_string()),
+    )
+        .into_response()
+}
+
+/// 把单个 AvailableModel 转成 OpenAI 风格的扁平 JSON（前端可直接渲染）。
+fn model_to_view(m: &crate::auth::kiro_models::AvailableModel) -> Value {
+    json!({
+        "id": m.model_id,
+        "name": if m.model_name.is_empty() { &m.model_id } else { &m.model_name },
+        "description": m.description,
+        "provider": m.provider,
+        "is_default": m.is_default.unwrap_or(false),
+        "context_window": m.context_window,
+        "rate_multiplier": m.rate_multiplier,
+        "rate_unit": m.rate_unit,
+        "capabilities": m.capabilities,
+        "supported_input_types": m.supported_input_types,
+        "token_limits": m.token_limits,
+        "prompt_caching": m.prompt_caching,
+    })
 }
 
 // ===== 导入 =====
