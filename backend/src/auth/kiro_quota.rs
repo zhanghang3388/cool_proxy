@@ -90,6 +90,21 @@ pub async fn fetch_kiro_usage(
 
     if !status.is_success() {
         let reason = parse_runtime_error_reason(&body);
+        // 组织/企业托管账号没有可查的个人额度：getUsageLimits 会回 400 "Invalid profileArn"
+        // （额度按组织池子算，不按人头）。这不是错误——与 Kiro-account-manager 一致（企业号
+        // 只显示套餐名）：按"企业版、无个人额度"优雅返回，账号正常可用、不报错、不禁用。
+        let no_personal_quota = status == reqwest::StatusCode::BAD_REQUEST
+            && reason
+                .as_deref()
+                .map(|r| r.to_ascii_lowercase().contains("profilearn"))
+                .unwrap_or(false);
+        if no_personal_quota {
+            return Ok(KiroUsageSnapshot {
+                plan_name: Some("Enterprise（无个人额度）".to_string()),
+                raw: serde_json::from_str(&body).unwrap_or(Value::Null),
+                ..Default::default()
+            });
+        }
         // 仅当原因确实是封禁/停用类才标 BANNED；401 / “bearer token invalid” 这类是
         // 认证错误（可刷新/可恢复），不应禁用账号——之前对任何错误一律标 BANNED 是误判。
         if let Some(r) = reason.as_deref() {
