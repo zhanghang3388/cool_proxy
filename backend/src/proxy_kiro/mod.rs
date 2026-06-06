@@ -169,61 +169,64 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
             "kiro forwarding"
         );
 
-        // 依次尝试端点：先打账号自身 region，然后兜底列表（去重）。
-        // 之前硬编码 us-east-1 的 CodeWhisperer/AmazonQ 双端点会让企业号 region 错位时
-        // 持续 403 —— 与 KAM 一致：URL 由账号 region 决定。
+        // 与 KAM 一致：URL 由账号 region 决定，不做额外的 region fallback。
+        // 之前我加了 fallback 列表会掩盖真实错误（同账号换 region 通常一样 403），
+        // 还会让"实际命中的 region"和"账号绑定的 region"不一致，调试困难。
         let primary_region = upstream::resolve_account_region(
             selected.profile_arn.as_deref(),
             selected.idc_region.as_deref(),
         );
-        let mut endpoints_tried: Vec<String> = Vec::with_capacity(5);
-        endpoints_tried.push(primary_region.clone());
-        for ep in upstream::KIRO_FALLBACK_ENDPOINTS {
-            if !endpoints_tried.iter().any(|r| r == ep.region) {
-                endpoints_tried.push(ep.region.to_string());
-            }
-        }
+
+        // 诊断日志：把实际用到的 region / profile_arn / provider 全打出来，
+        // 方便定位 "subscription does not support" / "User is not authorized" 这类
+        // AWS 按订阅 + profileArn + region 反查时拒绝的错误。
+        info!(
+            attempt,
+            account = %selected.id,
+            provider = %selected.provider,
+            auth_method = %selected.auth_method,
+            region = %primary_region,
+            profile_arn = ?selected.profile_arn,
+            machine_id = ?selected.machine_id,
+            model = %model,
+            stream = client_wants_stream,
+            "kiro forwarding to q.{}.amazonaws.com",
+            primary_region
+        );
 
         let mut endpoint_resp = None;
         let mut endpoint_err: Option<String> = None;
         let mut auth_failed = false;
-        for region in &endpoints_tried {
-            match upstream::call_kiro(
-                &app.clients,
-                region,
-                &translated.payload,
-                &selected.access_token,
-                &selected.auth_method,
-                selected.machine_id.as_deref(),
-                &selected.proxy_url,
-            )
-            .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        endpoint_resp = Some(resp);
-                        break;
-                    }
+        match upstream::call_kiro(
+            &app.clients,
+            &primary_region,
+            &translated.payload,
+            &selected.access_token,
+            &selected.auth_method,
+            selected.machine_id.as_deref(),
+            &selected.proxy_url,
+        )
+        .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    endpoint_resp = Some(resp);
+                } else {
                     let code = status.as_u16();
                     let snippet = read_snippet(resp).await;
-                    // 401/403：同账号换端点也没用，直接按账号级错误处理后跳出
                     if code == 401 || code == 403 {
                         handle_auth_error(&app, &selected.id, code, &snippet);
                         auth_failed = true;
-                        endpoint_err =
-                            Some(format!("upstream {code} on q.{region}.amazonaws.com: {snippet}"));
-                        break;
                     }
-                    // 429 / 其它：记下来换下一个端点再试
-                    endpoint_err =
-                        Some(format!("upstream {code} on q.{region}.amazonaws.com: {snippet}"));
-                    continue;
+                    endpoint_err = Some(format!(
+                        "upstream {code} on q.{primary_region}.amazonaws.com: {snippet}"
+                    ));
                 }
-                Err(e) => {
-                    endpoint_err = Some(format!("network on q.{region}.amazonaws.com: {e}"));
-                    continue;
-                }
+            }
+            Err(e) => {
+                endpoint_err =
+                    Some(format!("network on q.{primary_region}.amazonaws.com: {e}"));
             }
         }
 
