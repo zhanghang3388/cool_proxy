@@ -8,14 +8,20 @@
 //! [headers ...][payload ...][4B message_crc]
 //! ```
 //!
-//! 我们只关心 header 里的 `:event-type`（字符串值，类型 7）和 payload（JSON）。
+//! 我们关心 header 里的 `:event-type`、`:message-type`、`:exception-type`（都是字符串，
+//! 类型 7）和 payload（JSON）。`:message-type` 为 `error` / `exception` 时表示上游在 200
+//! 之后于流内报错 —— 这类帧没有 `:event-type`，必须单独识别，否则会被静默丢弃。
 //! 解析器是增量的：喂进字节，吐出已完整的帧；不够一帧就留在内部缓冲等下次。
 
 /// 一个解析出来的事件帧。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EventFrame {
     /// header `:event-type` 的值，例如 "assistantResponseEvent"。可能为空。
     pub event_type: String,
+    /// header `:message-type` 的值（"event" / "error" / "exception"）。可能为空。
+    pub message_type: String,
+    /// header `:exception-type` 的值（仅 exception 帧有），例如 "ThrottlingException"。
+    pub exception_type: String,
     /// payload 原始字节（通常是一段 JSON）。
     pub payload: Vec<u8>,
 }
@@ -62,10 +68,13 @@ impl EventStreamParser {
                 && payload_start <= payload_end
                 && payload_end <= self.buf.len()
             {
-                let event_type = extract_event_type(&self.buf[headers_start..headers_end]);
+                let (event_type, message_type, exception_type) =
+                    scan_headers(&self.buf[headers_start..headers_end]);
                 let payload = self.buf[payload_start..payload_end].to_vec();
                 out.push(EventFrame {
                     event_type,
+                    message_type,
+                    exception_type,
                     payload,
                 });
             }
@@ -76,11 +85,15 @@ impl EventStreamParser {
     }
 }
 
-/// 从 header 区段里扫出 `:event-type` 的字符串值。
+/// 从 header 区段里扫出 `:event-type` / `:message-type` / `:exception-type` 三个字符串值。
 ///
 /// header 编码：`[1B name_len][name][1B value_type][value...]`
 /// value_type == 7 表示 string：`[2B value_len][value]`。其余类型按其固定/变长长度跳过。
-fn extract_event_type(headers: &[u8]) -> String {
+/// 返回 `(event_type, message_type, exception_type)`，未出现的为空串。
+fn scan_headers(headers: &[u8]) -> (String, String, String) {
+    let mut event_type = String::new();
+    let mut message_type = String::new();
+    let mut exception_type = String::new();
     let mut off = 0usize;
     while off < headers.len() {
         let name_len = headers[off] as usize;
@@ -109,8 +122,13 @@ fn extract_event_type(headers: &[u8]) -> String {
                 }
                 let value = &headers[off..off + vlen];
                 off += vlen;
-                if name == b":event-type" {
-                    return String::from_utf8_lossy(value).into_owned();
+                match name {
+                    b":event-type" => event_type = String::from_utf8_lossy(value).into_owned(),
+                    b":message-type" => message_type = String::from_utf8_lossy(value).into_owned(),
+                    b":exception-type" => {
+                        exception_type = String::from_utf8_lossy(value).into_owned()
+                    }
+                    _ => {}
                 }
             }
             0 | 1 => {} // bool true/false：无额外字节
@@ -123,7 +141,7 @@ fn extract_event_type(headers: &[u8]) -> String {
             _ => break,     // 未知类型，无法安全跳过
         }
     }
-    String::new()
+    (event_type, message_type, exception_type)
 }
 
 #[cfg(test)]
@@ -184,5 +202,48 @@ mod tests {
         let frames = p.feed(b);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].event_type, "toolUseEvent");
+    }
+
+    /// 拼一帧带 `:message-type` + `:exception-type` 的 exception 帧（无 :event-type）。
+    fn build_exception_frame(exception_type: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        // :message-type = "exception"
+        let mt = b":message-type";
+        headers.push(mt.len() as u8);
+        headers.extend_from_slice(mt);
+        headers.push(7u8);
+        headers.extend_from_slice(&(9u16).to_be_bytes()); // "exception".len() == 9
+        headers.extend_from_slice(b"exception");
+        // :exception-type = exception_type
+        let xt = b":exception-type";
+        headers.push(xt.len() as u8);
+        headers.extend_from_slice(xt);
+        headers.push(7u8);
+        headers.extend_from_slice(&(exception_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(exception_type.as_bytes());
+
+        let headers_len = headers.len();
+        let total_len = 12 + headers_len + payload.len() + 4;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers_len as u32).to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn parses_exception_frame_headers() {
+        let body = br#"{"message":"rate exceeded"}"#;
+        let frame = build_exception_frame("ThrottlingException", body);
+        let mut p = EventStreamParser::new();
+        let frames = p.feed(&frame);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event_type, "");
+        assert_eq!(frames[0].message_type, "exception");
+        assert_eq!(frames[0].exception_type, "ThrottlingException");
+        assert_eq!(frames[0].payload, body);
     }
 }

@@ -50,6 +50,11 @@ pub struct KiroEventProcessor {
     pub usage: KiroUsage,
     /// 累积输出文本字符数（上游不给 outputTokens 时兜底估算）。
     output_chars: usize,
+    /// 上游在流内报错（`:message-type` = error/exception）。非"内容超长"类错误落到这里，
+    /// 由调用方发一条 Anthropic error SSE 收尾，而不是静默给客户端一个空响应。
+    pub error: Option<String>,
+    /// 上游异常导致的 stop_reason 覆写（如内容超长 → "max_tokens"）。
+    stop_reason_override: Option<&'static str>,
 }
 
 impl KiroEventProcessor {
@@ -57,9 +62,28 @@ impl KiroEventProcessor {
         Self::default()
     }
 
+    /// 流内是否捕获到硬错误时取走错误信息（只在第一次有值）。
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
+    /// 上游异常给出的 stop_reason 覆写（如内容超长 → "max_tokens"）。
+    pub fn stop_reason_override(&self) -> Option<&'static str> {
+        self.stop_reason_override
+    }
+
     /// 处理一帧，返回该帧产生的归一事件（可能为空）。
     pub fn process(&mut self, frame: &EventFrame) -> Vec<KiroEvent> {
         let mut out = Vec::new();
+
+        // 上游在 200 之后于流内报错：`:message-type` = error / exception。这类帧没有
+        // `:event-type`，旧实现会整帧丢弃，客户端只看到一个空响应、毫无报错（Claude Code
+        // 表现为"什么都没发生"）。这里识别出来，区分"内容超长"与真错误分别处理。
+        if frame.message_type == "error" || frame.message_type == "exception" {
+            self.handle_error_frame(frame);
+            return out;
+        }
+
         let event: Value = match serde_json::from_slice(&frame.payload) {
             Ok(v) => v,
             Err(_) => return out,
@@ -141,6 +165,48 @@ impl KiroEventProcessor {
         }
 
         out
+    }
+
+    fn handle_error_frame(&mut self, frame: &EventFrame) {
+        if self.error.is_some() {
+            return; // 只记第一个
+        }
+        // 取一段人类可读的错误信息：优先 payload JSON 的 message 字段，否则用原文片段。
+        let msg = serde_json::from_slice::<Value>(&frame.payload)
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .or_else(|| v.get("Message"))
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| {
+                let raw = String::from_utf8_lossy(&frame.payload);
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    "upstream stream error".to_string()
+                } else {
+                    raw.chars().take(400).collect()
+                }
+            });
+
+        let kind = frame.exception_type.to_ascii_lowercase();
+        let lower_msg = msg.to_ascii_lowercase();
+        // 内容超长：当作正常收尾 + stop_reason=max_tokens（对齐 kiro.rs），不算硬错误。
+        if kind.contains("contentlength")
+            || lower_msg.contains("content length")
+            || lower_msg.contains("too long")
+            || lower_msg.contains("input is too long")
+        {
+            self.stop_reason_override = Some("max_tokens");
+            return;
+        }
+        let label = if frame.exception_type.is_empty() {
+            "upstream error".to_string()
+        } else {
+            frame.exception_type.clone()
+        };
+        self.error = Some(format!("{label}: {msg}"));
     }
 
     fn handle_tool_use(&mut self, t: &Value, out: &mut Vec<KiroEvent>) {
@@ -415,11 +481,13 @@ impl ClaudeSseEncoder {
     }
 
     /// 收尾：关闭未闭合的块，发 message_delta + message_stop。
-    pub fn finish(&mut self, usage: &KiroUsage) -> String {
+    /// `stop_override` 来自上游异常（如内容超长 → "max_tokens"），有值时优先。
+    pub fn finish(&mut self, usage: &KiroUsage, stop_override: Option<&str>) -> String {
         let mut out = String::new();
         self.close_text(&mut out);
         self.close_thinking(&mut out);
-        let stop_reason = if self.has_tool { "tool_use" } else { "end_turn" };
+        let stop_reason =
+            stop_override.unwrap_or(if self.has_tool { "tool_use" } else { "end_turn" });
         let mut usage_obj = json!({
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
@@ -461,6 +529,7 @@ pub fn aggregate(
     usage: &KiroUsage,
     model: &str,
     restore: &std::collections::HashMap<String, String>,
+    stop_override: Option<&str>,
 ) -> Value {
     let mut content_blocks: Vec<Value> = Vec::new();
     let mut text_acc = String::new();
@@ -502,7 +571,7 @@ pub fn aggregate(
     }
     flush_text(&mut text_acc, &mut content_blocks);
 
-    let stop_reason = if has_tool { "tool_use" } else { "end_turn" };
+    let stop_reason = stop_override.unwrap_or(if has_tool { "tool_use" } else { "end_turn" });
     let mut usage_obj = json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
@@ -524,4 +593,69 @@ pub fn aggregate(
         "stop_sequence": null,
         "usage": usage_obj,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy_kiro::eventstream::EventFrame;
+
+    fn exception_frame(exception_type: &str, payload: &[u8]) -> EventFrame {
+        EventFrame {
+            event_type: String::new(),
+            message_type: "exception".to_string(),
+            exception_type: exception_type.to_string(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn captures_upstream_exception_frame() {
+        let mut proc = KiroEventProcessor::new();
+        let evs = proc.process(&exception_frame(
+            "ThrottlingException",
+            br#"{"message":"rate exceeded"}"#,
+        ));
+        assert!(evs.is_empty(), "error frame yields no content events");
+        let err = proc.take_error().expect("error captured, not silently dropped");
+        assert!(err.contains("ThrottlingException"), "got {err:?}");
+        assert!(err.contains("rate exceeded"), "got {err:?}");
+    }
+
+    #[test]
+    fn content_length_exception_sets_max_tokens_not_hard_error() {
+        let mut proc = KiroEventProcessor::new();
+        let _ = proc.process(&exception_frame(
+            "ContentLengthExceededException",
+            br#"{"message":"Input is too long"}"#,
+        ));
+        assert!(
+            proc.take_error().is_none(),
+            "content-length is a soft stop, not a hard error"
+        );
+        assert_eq!(proc.stop_reason_override(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn finish_honors_stop_override() {
+        let mut enc = ClaudeSseEncoder::new("claude-sonnet-4.5".to_string(), Default::default());
+        let _ = enc.start(1);
+        let out = enc.finish(&KiroUsage::default(), Some("max_tokens"));
+        assert!(out.contains("\"stop_reason\":\"max_tokens\""), "got {out}");
+    }
+
+    #[test]
+    fn normal_event_frame_still_parses() {
+        // message_type = "event" 的正常帧不受错误分支影响。
+        let mut proc = KiroEventProcessor::new();
+        let frame = EventFrame {
+            event_type: "assistantResponseEvent".to_string(),
+            message_type: "event".to_string(),
+            exception_type: String::new(),
+            payload: br#"{"content":"hi"}"#.to_vec(),
+        };
+        let evs = proc.process(&frame);
+        assert_eq!(evs.len(), 1);
+        assert!(proc.take_error().is_none());
+    }
 }

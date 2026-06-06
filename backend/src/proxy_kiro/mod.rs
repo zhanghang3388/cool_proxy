@@ -393,24 +393,50 @@ fn stream_response(
 
         yield Ok::<_, std::io::Error>(bytes::Bytes::from(encoder.start(input_est)));
 
-        while let Some(chunk) = upstream.next().await {
-            match chunk {
-                Ok(b) => {
-                    for frame in parser.feed(&b) {
-                        for ev in proc.process(&frame) {
-                            let sse = encoder.encode(&ev);
-                            if !sse.is_empty() {
-                                yield Ok(bytes::Bytes::from(sse));
+        // 每 20s 发一个 ping 保活。Claude Code 的首条请求（大 system prompt + 一堆工具）
+        // 上游首 token 可能很久，期间若长时间无字节，CC 会把连接当作 stalled 而断开。
+        // 对齐 kiro.rs：流式期间周期性发 `event: ping`。
+        let mut ping = tokio::time::interval(std::time::Duration::from_secs(20));
+        ping.tick().await; // 吃掉 interval 立即触发的第一拍
+
+        loop {
+            tokio::select! {
+                // biased：优先处理上游数据，ping 只在确实空闲时发，避免抢占数据。
+                biased;
+                chunk = upstream.next() => {
+                    match chunk {
+                        Some(Ok(b)) => {
+                            for frame in parser.feed(&b) {
+                                for ev in proc.process(&frame) {
+                                    let sse = encoder.encode(&ev);
+                                    if !sse.is_empty() {
+                                        yield Ok(bytes::Bytes::from(sse));
+                                    }
+                                }
+                            }
+                            // 上游在 200 之后于流内报错：发一条 Anthropic error SSE 收尾，
+                            // 别让 CC 拿到一个"正常但空"的响应（旧实现会静默丢弃错误帧）。
+                            if let Some(err) = proc.take_error() {
+                                let line = ClaudeSseEncoder::error(502, &err);
+                                yield Ok(bytes::Bytes::from(line));
+                                stream_err = Some(err);
+                                break;
                             }
                         }
+                        Some(Err(e)) => {
+                            let msg = format!("upstream stream error: {e}");
+                            let line = ClaudeSseEncoder::error(502, &msg);
+                            yield Ok(bytes::Bytes::from(line));
+                            stream_err = Some(msg);
+                            break;
+                        }
+                        None => break,
                     }
                 }
-                Err(e) => {
-                    let msg = format!("upstream stream error: {e}");
-                    let line = ClaudeSseEncoder::error(502, &msg);
-                    yield Ok(bytes::Bytes::from(line));
-                    stream_err = Some(msg);
-                    break;
+                _ = ping.tick() => {
+                    yield Ok(bytes::Bytes::from_static(
+                        b"event: ping\ndata: {\"type\": \"ping\"}\n\n",
+                    ));
                 }
             }
         }
@@ -422,7 +448,8 @@ fn stream_response(
             }
         }
         let usage = proc.usage.clone();
-        yield Ok(bytes::Bytes::from(encoder.finish(&usage)));
+        let stop_override = proc.stop_reason_override();
+        yield Ok(bytes::Bytes::from(encoder.finish(&usage, stop_override)));
 
         // 按实际结果上报账号状态 + 写请求日志
         let (status_code, err_msg) = match &stream_err {
@@ -514,6 +541,27 @@ async fn aggregate_response(
     }
     events.extend(proc.finalize());
     let usage = proc.usage.clone();
+    let stop_override = proc.stop_reason_override();
+
+    // 上游在 200 之后于流内报错：按失败上报 + 记日志 + 回 502，
+    // 而不是把一个"正常但空"的 message 交给客户端。
+    if let Some(err) = proc.take_error() {
+        app.kiro_pool.report_failure_for(&account_id, &err);
+        app.request_log.push(
+            &method,
+            "/kiro/v1/messages",
+            Some(account_id.clone()),
+            Some(model.clone()),
+            502,
+            started.elapsed().as_millis() as u64,
+            attempt_count,
+            None,
+            None,
+            None,
+            Some(err.clone()),
+        );
+        return anthropic_error(StatusCode::BAD_GATEWAY, &err);
+    }
 
     app.kiro_pool.report_success_for(&account_id);
     let total = usage.input_tokens + usage.output_tokens;
@@ -531,6 +579,6 @@ async fn aggregate_response(
         None,
     );
 
-    let obj = aggregate(&events, &usage, &model, &restore);
+    let obj = aggregate(&events, &usage, &model, &restore, stop_override);
     (StatusCode::OK, axum::Json(obj)).into_response()
 }
