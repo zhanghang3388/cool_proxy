@@ -55,8 +55,11 @@ pub struct KiroUsageSnapshot {
     pub raw: Value,
 }
 
-/// 拉取账号额度。`profile_arn` 用于定位 region + 鉴权，无 ARN 时直接报错。
-/// 上游返回 403 / 带封禁原因时，返回 `Err("BANNED:<reason>")`，调用方据此标记账号。
+/// 拉取账号额度。按账号 `idc_region` 推断的端点优先，再补 q.us-east-1 / q.eu-central-1，
+/// **遍历**候选端点、接受第一个 2xx——企业 IdC 账号的 Q profile 只托管在某一个固定区域，
+/// 打错区域上游可能回 400（不是 403），单端点 + 仅 403 回退会漏掉真正托管 profile 的区域
+/// （对齐 Kiro-account-manager verifyAlive 的双端点遍历）。
+/// 任一端点上识别出封禁原因时返回 `Err("BANNED:<reason>")`，调用方据此标记账号。
 pub async fn fetch_kiro_usage(
     clients: &Arc<ProxiedClients>,
     account_id: &str,
@@ -68,56 +71,66 @@ pub async fn fetch_kiro_usage(
         anyhow::bail!("missing access_token");
     }
 
-    // 端点按账号自身 region（idc_region）选择，缺省 us-east-1。
+    // 候选端点：先按账号自身 region（idc_region）推断的端点（覆盖 gov/iso 专用端点），
+    // 再补两个标准区域端点 q.us-east-1 / q.eu-central-1（去重）。
     let region = idc_region.filter(|s| !s.trim().is_empty());
-    let primary = runtime_endpoint_for_region(region);
-    // 403 视为区域不对（不是封禁），回退另一个区域端点——与 Kiro-account-manager 一致。
-    let fallback = if primary.contains("eu-central-1") {
-        "https://q.us-east-1.amazonaws.com"
-    } else {
-        "https://q.eu-central-1.amazonaws.com"
-    };
+    let mut endpoints = vec![runtime_endpoint_for_region(region)];
+    for std_ep in [
+        "https://q.us-east-1.amazonaws.com",
+        "https://q.eu-central-1.amazonaws.com",
+    ] {
+        if !endpoints.iter().any(|e| e == std_ep) {
+            endpoints.push(std_ep.to_string());
+        }
+    }
 
     let machine_id = stable_machine_id(account_id);
     let http = clients.get(proxy_url)?;
 
-    let (status, body) = send_usage(&http, &primary, access_token, &machine_id).await?;
-    let (status, body) = if status == reqwest::StatusCode::FORBIDDEN {
-        send_usage(&http, fallback, access_token, &machine_id).await?
-    } else {
-        (status, body)
-    };
-
-    if !status.is_success() {
-        let reason = parse_runtime_error_reason(&body);
-        // 组织/企业托管账号没有可查的个人额度：getUsageLimits 会回 400 "Invalid profileArn"
-        // （额度按组织池子算，不按人头）。这不是错误——与 Kiro-account-manager 一致（企业号
-        // 只显示套餐名）：按"企业版、无个人额度"优雅返回，账号正常可用、不报错、不禁用。
-        let no_personal_quota = status == reqwest::StatusCode::BAD_REQUEST
-            && reason
-                .as_deref()
-                .map(|r| r.to_ascii_lowercase().contains("profilearn"))
-                .unwrap_or(false);
-        if no_personal_quota {
-            return Ok(KiroUsageSnapshot {
-                plan_name: Some("Enterprise（无个人额度）".to_string()),
-                raw: serde_json::from_str(&body).unwrap_or(Value::Null),
-                ..Default::default()
-            });
+    // 遍历候选端点：第一个 2xx 即解析返回；任一端点上命中封禁原因立即终止；
+    // 否则记录最后一次非 2xx，留待循环后统一判定（无个人额度 / 报错）。
+    let mut last: Option<(reqwest::StatusCode, String)> = None;
+    for endpoint in &endpoints {
+        let (status, body) = send_usage(&http, endpoint, access_token, &machine_id).await?;
+        if status.is_success() {
+            let usage: Value =
+                serde_json::from_str(&body).with_context(|| "parse kiro usage response")?;
+            return Ok(parse_usage_snapshot(usage));
         }
-        // 仅当原因确实是封禁/停用类才标 BANNED；401 / “bearer token invalid” 这类是
-        // 认证错误（可刷新/可恢复），不应禁用账号——之前对任何错误一律标 BANNED 是误判。
-        if let Some(r) = reason.as_deref() {
+        // 真封禁/停用：任何端点上命中都立即终止，不必再试其它区域。
+        if let Some(r) = parse_runtime_error_reason(&body).as_deref() {
             if looks_like_ban(r) {
                 anyhow::bail!("BANNED:{}", r);
             }
         }
-        let detail = reason.unwrap_or_else(|| body.chars().take(512).collect::<String>());
-        anyhow::bail!("kiro usage request failed: {} {}", status, detail);
+        last = Some((status, body));
     }
 
-    let usage: Value = serde_json::from_str(&body).with_context(|| "parse kiro usage response")?;
-    Ok(parse_usage_snapshot(usage))
+    // 所有候选端点都非 2xx——到这里才允许降级或报错。
+    let (status, body) = last.expect("至少尝试过一个端点");
+    let reason = parse_runtime_error_reason(&body);
+
+    // 组织/企业托管账号没有可查的个人额度：所有区域端点都回 400 "Invalid profileArn"
+    // （额度按组织池子算、不按人头）。只有在**所有端点都试过**后仍是 400，才按"企业版、
+    // 无个人额度"优雅返回——账号正常可用、不报错、不禁用（对齐 Kiro-account-manager 企业号
+    // 只显示套餐名）。匹配放宽：reason 含 "profilearn"，或 400 但拿不到可读原因（AWS 可能把
+    // 校验消息放在 __type 等 parse_runtime_error_reason 不读的字段）都按无个人额度处理；
+    // 只有带明确"非 profilearn"原因的 400 才作为真错误暴露。
+    let no_personal_quota = status == reqwest::StatusCode::BAD_REQUEST
+        && reason
+            .as_deref()
+            .map(|r| r.to_ascii_lowercase().contains("profilearn"))
+            .unwrap_or(true);
+    if no_personal_quota {
+        return Ok(KiroUsageSnapshot {
+            plan_name: Some("Enterprise（无个人额度）".to_string()),
+            raw: serde_json::from_str(&body).unwrap_or(Value::Null),
+            ..Default::default()
+        });
+    }
+
+    let detail = reason.unwrap_or_else(|| body.chars().take(512).collect::<String>());
+    anyhow::bail!("kiro usage request failed: {} {}", status, detail);
 }
 
 /// 向某个区域端点发起一次 getUsageLimits，返回 (status, body)。逐字对齐 Kiro-account-manager
@@ -149,6 +162,14 @@ async fn send_usage(
         .with_context(|| "kiro usage request")?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    // 诊断用：记录真实响应 status + body 前 512 字符——确认企业号查额度命中的端点、
+    // 实际状态码（是否 400 / 是否含 "Invalid profileArn"）与降级路径。
+    tracing::info!(
+        "kiro getUsageLimits resp {} status={} body={}",
+        url,
+        status,
+        body.chars().take(512).collect::<String>()
+    );
     Ok((status, body))
 }
 
