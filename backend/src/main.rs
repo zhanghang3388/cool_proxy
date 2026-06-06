@@ -112,8 +112,22 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::post(proxy_kiro::messages_handler),
         )
         .route(
+            "/kiro/v1/messages/count_tokens",
+            axum::routing::post(proxy_kiro::count_tokens_handler),
+        )
+        .route(
             "/kiro/v1/models",
             axum::routing::get(proxy_kiro::models_handler),
+        )
+        // 根路径别名：Claude Code 把 base URL 设成裸 host（不带 /kiro）时也能用，
+        // 默认走 kiro 池。注意根 /v1/models 已被 OpenAI 反代占用，这里不重复注册。
+        .route(
+            "/v1/messages",
+            axum::routing::post(proxy_kiro::messages_handler),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(proxy_kiro::count_tokens_handler),
         )
         // Claude 反代（Anthropic Messages API，OAuth 令牌转发到 api.anthropic.com）
         .route(

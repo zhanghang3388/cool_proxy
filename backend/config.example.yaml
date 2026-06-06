@@ -33,3 +33,15 @@ token_refresh:
 # 日志
 log:
   level: "info"   # trace / debug / info / warn / error
+
+# Kiro 反代：对 Claude Code 系统提示的过滤（全部可选，不写则用下面的默认值）
+kiro:
+  # 检测到 Claude Code 系统提示时，整体替换成精简后端提示。
+  # 较激进（会丢掉 CC 自带的工具说明等），默认关；仍命中身份类 403 时再打开。
+  filter_claude_code: false
+  # 去掉 "--- SYSTEM PROMPT ---" 之类边界标记。安全，默认开。
+  strip_boundaries: true
+  # 去掉环境/身份噪音行（gitStatus / Recent commits / knowledge cutoff /
+  # "you are claude code" / # Environment 段等）。默认开。
+  env_noise: true
+

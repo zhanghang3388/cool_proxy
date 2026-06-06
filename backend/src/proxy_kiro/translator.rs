@@ -14,6 +14,7 @@ use super::payload::{
     KiroToolSpecification, KiroToolUse, KiroToolWrapper, KiroUserInputMessage,
     KiroUserInputMessageContext,
 };
+use super::prompt_filter::{self, PromptFilterOptions};
 use crate::proxy::translator::tool_names::build_short_name_map;
 
 const ORIGIN: &str = "AI_EDITOR";
@@ -29,7 +30,11 @@ pub struct Translated {
 }
 
 /// 主入口：解析 Anthropic Messages 请求 JSON。
-pub fn translate(raw: &Value, profile_arn: &str) -> Result<Translated, String> {
+pub fn translate(
+    raw: &Value,
+    profile_arn: &str,
+    filter: PromptFilterOptions,
+) -> Result<Translated, String> {
     let model = raw
         .get("model")
         .and_then(|v| v.as_str())
@@ -64,7 +69,8 @@ pub fn translate(raw: &Value, profile_arn: &str) -> Result<Translated, String> {
     };
 
     // ===== system prompt =====
-    let mut system_prompt = extract_system(raw.get("system"));
+    // 先过滤掉 Claude Code 的身份/环境噪音（对齐 KAM），再前置时间戳。
+    let mut system_prompt = prompt_filter::apply(filter, &extract_system(raw.get("system")));
     let timestamp = chrono::Utc::now().to_rfc3339();
     system_prompt = format!("[Context: Current time is {timestamp}]\n\n{system_prompt}");
 
@@ -210,12 +216,15 @@ pub fn translate(raw: &Value, profile_arn: &str) -> Result<Translated, String> {
     let tools = convert_tools(raw.get("tools"), &to_kiro_name);
 
     // ===== thinking =====
-    let thinking = raw
+    // 来源一：显式 thinking 参数（type != "disabled"）；
+    // 来源二：model 名带 `-thinking` 后缀（归一化时已从 modelId 剥掉，这里据原名判定）。
+    let thinking_param = raw
         .get("thinking")
         .and_then(|t| t.get("type"))
         .and_then(|v| v.as_str())
         .map(|s| s != "disabled")
         .unwrap_or(false);
+    let thinking = thinking_param || model.to_ascii_lowercase().ends_with("-thinking");
 
     let max_tokens = raw.get("max_tokens").and_then(|v| v.as_i64());
     let temperature = raw.get("temperature").and_then(|v| v.as_f64());
@@ -529,6 +538,7 @@ mod tests {
         let t = translate(
             &raw,
             "arn:aws:codewhisperer:us-east-1:123456789012:profile/X",
+            PromptFilterOptions::default(),
         )
         .expect("translate should not fail");
         let payload_json = serde_json::to_string(&t.payload).expect("payload serializes");

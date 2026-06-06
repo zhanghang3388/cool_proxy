@@ -4,6 +4,7 @@
 
 pub mod eventstream;
 pub mod payload;
+pub mod prompt_filter;
 pub mod response;
 pub mod translator;
 pub mod upstream;
@@ -97,6 +98,26 @@ pub async fn models_handler(State(app): State<Arc<AppState>>, req: Request) -> R
     axum::Json(json!({"object": "list", "data": data})).into_response()
 }
 
+/// `POST /kiro/v1/messages/count_tokens`（及根路径别名）。
+///
+/// Claude Code 在发正式消息前/中会打这个端点估算上下文大小。Kiro 上游没有对应接口，
+/// 这里本地粗略估算即可（客户端只用它判断是否要压缩上下文，估算值容差很大）。
+/// 之前没有这个路由 → CC 预检拿到 404 → 报错 / 体验异常。
+pub async fn count_tokens_handler(State(app): State<Arc<AppState>>, req: Request) -> Response {
+    if !verify_client_key(req.headers(), &app.config.api_keys) {
+        return anthropic_error(StatusCode::UNAUTHORIZED, "missing or invalid api key");
+    }
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return anthropic_error(StatusCode::BAD_REQUEST, &format!("read request body: {e}"))
+        }
+    };
+    // 粗略估算：请求体字节数 / 4（偏保守；至少为 1）。
+    let estimate = (body_bytes.len() / 4).max(1);
+    axum::Json(json!({ "input_tokens": estimate })).into_response()
+}
+
 /// `POST /kiro/v1/messages`：Anthropic Messages 反代主入口。
 pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) -> Response {
     if !verify_client_key(req.headers(), &app.config.api_keys) {
@@ -150,7 +171,12 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
         last_account = Some(selected.id.clone());
 
         // 翻译请求（每次重试都重建，conversationId/continuationId 会刷新，没问题）
-        let translated = match translator::translate(&raw, selected.profile_arn.as_deref().unwrap_or("")) {
+        let filter = prompt_filter::PromptFilterOptions::from_config(&app.config.kiro);
+        let translated = match translator::translate(
+            &raw,
+            selected.profile_arn.as_deref().unwrap_or(""),
+            filter,
+        ) {
             Ok(t) => t,
             Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e),
         };

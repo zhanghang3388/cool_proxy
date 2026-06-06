@@ -15,6 +15,39 @@ pub struct Config {
     pub token_refresh: TokenRefreshConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub kiro: KiroConfig,
+}
+
+/// Kiro 反代专属配置（system prompt 过滤，对齐 KAM gateway/prompt_filter.rs）。
+/// 全部可选：老配置文件不写也能跑（serde default）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KiroConfig {
+    /// 检测到 Claude Code 系统提示（≥2 个特征标记）时，整体替换成精简后端提示。
+    /// 较激进（会丢掉 CC 的工具说明等），默认关。仍命中身份类 403 时可打开。
+    #[serde(default)]
+    pub filter_claude_code: bool,
+    /// 去掉 `--- SYSTEM PROMPT ---` 之类边界标记。安全，默认开。
+    #[serde(default = "default_true")]
+    pub strip_boundaries: bool,
+    /// 去掉环境/身份噪音行（gitStatus / Recent commits / knowledge cutoff /
+    /// "you are claude code" / # Environment 段等）。默认开。
+    #[serde(default = "default_true")]
+    pub env_noise: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for KiroConfig {
+    fn default() -> Self {
+        Self {
+            filter_claude_code: false,
+            strip_boundaries: true,
+            env_noise: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
