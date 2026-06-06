@@ -37,32 +37,192 @@ fn anthropic_error(status: StatusCode, message: &str) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-/// `GET /kiro/v1/models`：返回 Kiro 支持的模型列表（Anthropic/OpenAI 通用形状）。
+/// `GET /kiro/v1/models`：返回 Kiro 当前账号池里某个可用账号支持的模型清单。
+///
+/// 行为与 KAM `list_available_models` 对齐：
+///  - 先 round-robin 选一个可用账号；
+///  - 该账号有 fresh 缓存（30 分钟）且不要求强刷，直接返回缓存；
+///  - 否则去打 `q.{region}.amazonaws.com/ListAvailableModels` 翻页聚合，
+///    成功时写回缓存；401 自动 refresh + 重试一次；403 + suspended 标 banned；
+///  - 输出形态走 OpenAI / Anthropic 通用 `{ "object": "list", "data": [...] }`，
+///    以便客户端把它当 `/v1/models` 用。客户端可加 `?force=1` 强制刷新。
 pub async fn models_handler(State(app): State<Arc<AppState>>, req: Request) -> Response {
     if !verify_client_key(req.headers(), &app.config.api_keys) {
         return anthropic_error(StatusCode::UNAUTHORIZED, "missing or invalid api key");
     }
-    let now = 1_700_000_000u64;
-    let ids = [
-        "claude-sonnet-4.5",
-        "claude-sonnet-4",
-        "claude-haiku-4.5",
-        "claude-opus-4.5",
-    ];
-    let data: Vec<Value> = ids
-        .iter()
-        .map(|id| {
-            json!({
-                "id": id,
-                "type": "model",
-                "object": "model",
-                "created": now,
-                "owned_by": "kiro",
-                "display_name": id,
+
+    let force_refresh = req
+        .uri()
+        .query()
+        .map(|q| {
+            q.split('&').any(|kv| {
+                let mut it = kv.splitn(2, '=');
+                matches!(it.next(), Some("force") | Some("force_refresh"))
+                    && matches!(it.next().unwrap_or(""), "1" | "true" | "yes")
             })
         })
-        .collect();
-    axum::Json(json!({"object": "list", "data": data})).into_response()
+        .unwrap_or(false);
+
+    // 客户端可以选 modelProvider（KAM 单页参数）。默认 None = 让上游返回全集。
+    let model_provider = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let mut it = kv.splitn(2, '=');
+            if matches!(it.next(), Some("model_provider") | Some("modelProvider")) {
+                it.next().map(|v| v.to_string())
+            } else {
+                None
+            }
+        })
+    });
+
+    match fetch_models_for_pool(&app, model_provider.as_deref(), force_refresh).await {
+        Ok(models) => {
+            let now = chrono::Utc::now().timestamp() as u64;
+            let data: Vec<Value> = models
+                .available_models
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.model_id,
+                        "type": "model",
+                        "object": "model",
+                        "created": now,
+                        "owned_by": m.provider.as_deref().unwrap_or("kiro"),
+                        "display_name": if m.model_name.is_empty() { &m.model_id } else { &m.model_name },
+                        "description": m.description,
+                        "is_default": m.is_default.unwrap_or(false),
+                        "context_window": m.context_window,
+                        "rate_multiplier": m.rate_multiplier,
+                        "rate_unit": m.rate_unit,
+                        "supported_input_types": m.supported_input_types,
+                        "token_limits": m.token_limits,
+                        "prompt_caching": m.prompt_caching,
+                        "capabilities": m.capabilities,
+                    })
+                })
+                .collect();
+            axum::Json(json!({
+                "object": "list",
+                "data": data,
+                "default_model": models.default_model.as_ref().map(|m| &m.model_id),
+            }))
+            .into_response()
+        }
+        Err((status, msg)) => anthropic_error(status, &msg),
+    }
+}
+
+/// 统一的模型拉取流程：池子选账号 → 缓存命中？→ 上游拉 → 缓存写回 → 401 refresh 重试 1 次。
+async fn fetch_models_for_pool(
+    app: &Arc<AppState>,
+    model_provider: Option<&str>,
+    force_refresh: bool,
+) -> Result<crate::auth::kiro_models::ListAvailableModelsResponse, (StatusCode, String)> {
+    use crate::auth::kiro_models::{
+        build_cache_entry, fetch_all_available_models, read_models_cache, ListModelsQuery,
+    };
+
+    // 选一个账号。/v1/models 是只读探活，没必要做多账号轮替——选到第一个能用的就够。
+    let selected = match app.kiro_pool.pick() {
+        Ok(s) => s,
+        Err(KiroPoolError::Empty) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no kiro accounts configured".to_string(),
+            ));
+        }
+        Err(KiroPoolError::AllUnavailable) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "all kiro accounts cooling down or disabled".to_string(),
+            ));
+        }
+    };
+
+    // 1) 缓存命中直接返回
+    if !force_refresh {
+        if let Some(acc) = app.kiro_pool.get(&selected.id) {
+            if let Some(cached) = read_models_cache(&acc.models_cache, model_provider, false) {
+                return Ok(cached);
+            }
+        }
+    }
+
+    // 2) 拉上游 + 一次性 401 重试
+    let mut access_token = selected.access_token.clone();
+    let mut profile_arn = selected.profile_arn.clone();
+    let mut idc_region = selected.idc_region.clone();
+    let mut machine_id = selected.machine_id.clone();
+
+    let mut last_err: Option<String> = None;
+    for attempt in 0..2u32 {
+        let result = fetch_all_available_models(
+            &app.clients,
+            ListModelsQuery {
+                access_token: &access_token,
+                provider: &selected.provider,
+                idc_region: idc_region.as_deref(),
+                profile_arn: profile_arn.as_deref(),
+                machine_id: machine_id.as_deref(),
+                model_provider,
+                proxy_url: &selected.proxy_url,
+            },
+        )
+        .await;
+
+        match result {
+            Ok(resp) => {
+                let entry = build_cache_entry(&resp, model_provider);
+                app.kiro_pool.update_models_cache(&selected.id, &entry);
+                return Ok(resp);
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                last_err = Some(msg.clone());
+                // 第一次失败若是 AUTH_ERROR，尝试 refresh 一次再重试。
+                if attempt == 0 && msg.contains("AUTH_ERROR:") {
+                    if let Some(_guard) = app.kiro_refresher.begin_refresh(&selected.id) {
+                        if let Some(acc) = app.kiro_pool.get(&selected.id) {
+                            match app.kiro_refresher.refresh(&acc).await {
+                                Ok(update) => {
+                                    app.kiro_pool.update_after_refresh(&selected.id, &update);
+                                    if let Some(fresh) = app.kiro_pool.get(&selected.id) {
+                                        access_token = fresh.access_token.clone();
+                                        profile_arn = crate::pool::kiro::resolve_profile_arn_for_upstream(&fresh);
+                                        idc_region = fresh.idc_region.clone();
+                                        machine_id = fresh.machine_id.clone();
+                                    }
+                                    continue;
+                                }
+                                Err(refresh_err) => {
+                                    return Err((
+                                        StatusCode::BAD_GATEWAY,
+                                        format!("token refresh failed: {refresh_err:#}"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                // BANNED / 不可恢复错误：标账号
+                if msg.contains("BANNED:") {
+                    let reason = msg
+                        .split("BANNED:")
+                        .nth(1)
+                        .map(str::trim)
+                        .unwrap_or("suspended")
+                        .to_string();
+                    app.kiro_pool.mark_banned(&selected.id, &reason);
+                }
+                break;
+            }
+        }
+    }
+
+    Err((
+        StatusCode::BAD_GATEWAY,
+        last_err.unwrap_or_else(|| "ListAvailableModels failed".to_string()),
+    ))
 }
 
 /// `POST /kiro/v1/messages`：Anthropic Messages 反代主入口。

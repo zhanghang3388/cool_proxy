@@ -89,6 +89,9 @@ pub struct KiroAccountRow {
     /// usage_data：与 raw_usage 同义，但 KAM 沿用这个字段名。getUsageLimits 原始体。
     #[serde(skip)]
     pub usage_data: Value,
+    /// ListAvailableModels 缓存：`{ cached_at, response, model_provider }`。30 分钟 TTL。
+    #[serde(skip)]
+    pub models_cache: Value,
 }
 
 impl KiroAccountRow {
@@ -148,6 +151,7 @@ impl KiroAccountRow {
             raw_auth_token: data.raw_auth_token.clone(),
             raw_usage: data.raw_usage.clone(),
             usage_data: data.raw_usage.clone(),
+            models_cache: Value::Object(Default::default()),
         }
     }
 
@@ -187,6 +191,7 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<KiroAccountRow> {
     let raw_auth_token = json_from_str(&col_string(r, "raw_auth_token")?);
     let raw_usage = json_from_str(&col_string(r, "raw_usage")?);
     let usage_data = json_from_str(&col_string(r, "usage_data")?);
+    let models_cache = json_from_str(&col_string(r, "models_cache")?);
     // provider 列在新 schema 才有；旧库 / 旧行可能为 NULL，由调用方负责 backfill。
     let provider = r
         .get::<_, Option<String>>("provider")?
@@ -241,6 +246,7 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<KiroAccountRow> {
         raw_auth_token,
         raw_usage,
         usage_data,
+        models_cache,
     })
 }
 
@@ -691,6 +697,26 @@ pub fn update_quota_error(pool: &SqlitePool, id: &str, msg: &str) -> Result<bool
     let n = conn.execute(
         "UPDATE kiro_accounts SET quota_checked_at = ?2, quota_error = ?3, status = ?4, status_reason = ?3 WHERE id = ?1",
         params![id, now, msg, crate::auth::kiro::KIRO_STATUS_ERROR],
+    )?;
+    Ok(n > 0)
+}
+
+/// 写入 ListAvailableModels 缓存（30 分钟 TTL，调用方负责打时间戳进 value）。
+pub fn update_models_cache(pool: &SqlitePool, id: &str, cache: &Value) -> Result<bool> {
+    let conn = pool.get()?;
+    let n = conn.execute(
+        "UPDATE kiro_accounts SET models_cache = ?2 WHERE id = ?1",
+        params![id, serde_json::to_string(cache).unwrap_or_else(|_| "{}".into())],
+    )?;
+    Ok(n > 0)
+}
+
+/// 清空 ListAvailableModels 缓存（账号刷过 token 后顺手做一次，避免缓存里 access_token 失配）。
+pub fn clear_models_cache(pool: &SqlitePool, id: &str) -> Result<bool> {
+    let conn = pool.get()?;
+    let n = conn.execute(
+        "UPDATE kiro_accounts SET models_cache = '{}' WHERE id = ?1",
+        params![id],
     )?;
     Ok(n > 0)
 }

@@ -262,6 +262,9 @@ impl KiroPool {
 
     pub fn update_after_refresh(&self, id: &str, u: &KiroTokenUpdate) {
         let _ = store_kiro::update_after_refresh(&self.db, id, u);
+        // token 刷新意味着账号"重新可用"——顺手清模型缓存，避免下次 /v1/models 返回
+        // 用旧 token 拉到的（且可能已不再可用的）模型集合。
+        let _ = store_kiro::clear_models_cache(&self.db, id);
     }
 
     pub fn mark_refresh_failed(&self, id: &str, msg: &str) {
@@ -274,6 +277,11 @@ impl KiroPool {
 
     pub fn update_quota_error(&self, id: &str, msg: &str) -> bool {
         store_kiro::update_quota_error(&self.db, id, msg).unwrap_or(false)
+    }
+
+    /// 写 ListAvailableModels 缓存。
+    pub fn update_models_cache(&self, id: &str, cache: &serde_json::Value) -> bool {
+        store_kiro::update_models_cache(&self.db, id, cache).unwrap_or(false)
     }
 
     pub fn stats_overview(&self) -> anyhow::Result<KiroStatsCounts> {

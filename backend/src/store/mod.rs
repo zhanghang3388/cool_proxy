@@ -227,6 +227,8 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
     ensure_column(conn, "kiro_accounts", "success_count", "INTEGER NOT NULL DEFAULT 0")?;
     // 禁用原因（与 enabled 配套，账号自动失效时落原因，便于诊断）。
     ensure_column(conn, "kiro_accounts", "disabled_reason", "TEXT")?;
+    // ListAvailableModels 缓存（JSON 对象，含 cached_at/response/model_provider）。
+    ensure_column(conn, "kiro_accounts", "models_cache", "TEXT NOT NULL DEFAULT '{}'")?;
     Ok(())
 }
 

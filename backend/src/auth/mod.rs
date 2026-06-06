@@ -3,6 +3,7 @@ pub mod claude_quota;
 pub mod claude_refresh;
 pub mod codex;
 pub mod kiro;
+pub mod kiro_models;
 pub mod kiro_quota;
 pub mod kiro_refresh;
 pub mod kiro_sso;
