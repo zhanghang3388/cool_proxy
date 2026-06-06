@@ -208,6 +208,25 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
     ensure_column(conn, "claude_accounts", "quota_week_reset_at", "INTEGER")?;
     ensure_column(conn, "claude_accounts", "quota_checked_at", "INTEGER")?;
     ensure_column(conn, "claude_accounts", "quota_error", "TEXT")?;
+
+    // === Kiro 账号增量列：仿 kiro-account-manager 的 Account 模型 ===
+    // 显式 provider（Google / Github / BuilderId / Enterprise），与原始来源一致；
+    // login_provider 仅用于兼容旧导入数据（旧版本字段命名）。
+    ensure_column(conn, "kiro_accounts", "provider", "TEXT")?;
+    // IdC 客户端身份指纹（{hash}.json 文件名）+ 企业 SSO Start URL。
+    ensure_column(conn, "kiro_accounts", "client_id_hash", "TEXT")?;
+    ensure_column(conn, "kiro_accounts", "start_url", "TEXT")?;
+    // OAuth/OIDC 衍生字段。
+    ensure_column(conn, "kiro_accounts", "id_token", "TEXT")?;
+    ensure_column(conn, "kiro_accounts", "sso_session_id", "TEXT")?;
+    // 每个账号绑定一个稳定 machineId（参与 user-agent + 上游身份识别）。
+    ensure_column(conn, "kiro_accounts", "machine_id", "TEXT")?;
+    // 上游 getUsageLimits 原始体（JSON），用于派生 capped/overage/封禁状态。
+    ensure_column(conn, "kiro_accounts", "usage_data", "TEXT NOT NULL DEFAULT '{}'")?;
+    // 成功计数（balanced 策略 / 监控用）。
+    ensure_column(conn, "kiro_accounts", "success_count", "INTEGER NOT NULL DEFAULT 0")?;
+    // 禁用原因（与 enabled 配套，账号自动失效时落原因，便于诊断）。
+    ensure_column(conn, "kiro_accounts", "disabled_reason", "TEXT")?;
     Ok(())
 }
 

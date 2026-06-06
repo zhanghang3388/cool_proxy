@@ -305,6 +305,9 @@ export interface KiroAccountView {
   id: string
   email: string
   user_id: string | null
+  /** 显式 provider：Google / Github / BuilderId / Enterprise */
+  provider: string
+  /** 兼容旧字段（与 provider 同值）。新代码请用 provider */
   login_provider: string | null
   auth_method: string
   enabled: boolean
@@ -312,8 +315,10 @@ export interface KiroAccountView {
   last_refresh_at: string | null
   last_used_at: string | null
   failure_count: number
+  success_count: number
   cooldown_until: string | null
   last_error: string | null
+  disabled_reason: string | null
   total_requests: number
   total_failures: number
   expired: boolean
@@ -321,6 +326,10 @@ export interface KiroAccountView {
   proxy_id: string | null
   status: string | null
   status_reason: string | null
+  start_url: string | null
+  client_id_hash: string | null
+  machine_id: string | null
+  region: string | null
   usage: KiroUsageView
 }
 
@@ -382,7 +391,10 @@ export interface KiroSsoLoginStartResp {
 }
 
 export async function kiroSsoLoginStart(payload: {
-  start_url: string
+  /** 不填则按 provider 推断（BuilderId 走默认 view.awsapps.com/start） */
+  start_url?: string
+  /** "BuilderId" 或 "Enterprise"。不填则按 start_url 推断 */
+  provider?: string
   region?: string
   proxy_id?: string
   url?: string

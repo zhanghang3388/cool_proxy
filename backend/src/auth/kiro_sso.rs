@@ -1,8 +1,15 @@
-//! Kiro 企业 SSO（AWS IAM Identity Center / Start URL）登录：OAuth2 Authorization Code + PKCE。
+//! Kiro SSO（AWS IAM Identity Center / Builder ID）登录：OAuth2 Authorization Code + PKCE。
 //!
-//! 复刻 Kiro IDE / Kiro-account-manager 的组织 Start URL 登录流程，但做成与 Claude OAuth
-//! 一致的“展示授权链接 → 用户自行在浏览器完成授权 → 手动回填授权码”两步式，便于在没有
-//! 本地浏览器的服务端使用。register / authorize / token 三步都打 `oidc.{region}.amazonaws.com`。
+//! 仿 KAM `IdcProvider::login`，但做成与 Claude OAuth 一致的"展示授权链接 → 用户在浏览器
+//! 完成授权 → 手动回填授权码"两步式，便于在没有本地浏览器的服务端使用。
+//!
+//! 与之前实现的差异：
+//!  - 同时支持 BuilderId（Start URL 默认 `view.awsapps.com/start`）与 Enterprise
+//!    （组织的 d-xxx 域名）—— 由调用方传 provider 决定；
+//!  - register 时 `redirectUris` **不带端口** 走 `http://127.0.0.1/oauth/callback`，
+//!    KAM v1.7.4+ 已确认这样才能拿到带 REFRESH_TOKEN grant 的 client（带端口注册的
+//!    client 一过期就拒刷）；authorize/token 仍用真实带端口的 redirect_uri；
+//!  - pending 上下文新增 provider 字段，为 token 交换后入池决定 provider。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -13,14 +20,18 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::auth::claude::gen_pkce;
+use crate::auth::kiro::{KIRO_PROVIDER_BUILDER_ID, KIRO_PROVIDER_ENTERPRISE};
 
 /// AWS OIDC 端点基址模板（client/register、authorize、token 共用）。
 const OIDC_BASE_FMT: &str = "https://oidc.{region}.amazonaws.com";
-/// 固定环回回调地址：authorize 只做 302 重定向，无需真实监听；register 与 token 交换
-/// 必须用同一个值，否则 redirect_uri 不匹配。
+/// 真实回调地址：authorize 返回时浏览器会跳到这里（端口固定，方便用户复制粘贴）。
 const REDIRECT_URI: &str = "http://127.0.0.1:54546/oauth/callback";
+/// register 时传给 AWS 的 redirect_uri：必须**不带端口**，才能拿到带 REFRESH_TOKEN grant
+/// 的 public client。带端口注册出来的 client `enabledGrants.REFRESH_TOKEN` 会缺失，
+/// IDE/KAM 一过期就刷不动。AWS 对 loopback 地址按 RFC 8252 允许任意端口匹配。
+const REGISTER_REDIRECT_URI: &str = "http://127.0.0.1/oauth/callback";
 /// CodeWhisperer / Q 所需 scope（与 Kiro IDE 一致）。
-const SCOPES: [&str; 5] = [
+pub const SCOPES: &[&str] = &[
     "codewhisperer:completions",
     "codewhisperer:analysis",
     "codewhisperer:conversations",
@@ -30,7 +41,7 @@ const SCOPES: [&str; 5] = [
 /// 待完成登录有效期：超过则需重新获取授权链接。
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// 一次进行中的企业 SSO 登录的暂存上下文（拿链接时写入，回填授权码时取出）。
+/// 一次进行中的 SSO 登录的暂存上下文（拿链接时写入，回填授权码时取出）。
 #[derive(Clone)]
 pub struct PendingKiroSso {
     pub verifier: String,
@@ -40,6 +51,8 @@ pub struct PendingKiroSso {
     pub start_url: String,
     pub proxy_url: String,
     pub email_hint: Option<String>,
+    /// "BuilderId" 或 "Enterprise" —— token 交换后用于决定入池 provider。
+    pub provider: String,
     created: Instant,
 }
 
@@ -59,11 +72,17 @@ impl KiroSsoLoginStore {
     pub async fn start(
         &self,
         http: &reqwest::Client,
+        provider: &str,
         start_url: &str,
         region: &str,
         proxy_url: &str,
         email_hint: Option<String>,
     ) -> Result<(String, String)> {
+        let provider = match provider {
+            KIRO_PROVIDER_BUILDER_ID => KIRO_PROVIDER_BUILDER_ID,
+            KIRO_PROVIDER_ENTERPRISE => KIRO_PROVIDER_ENTERPRISE,
+            other => anyhow::bail!("unsupported sso provider: {other}"),
+        };
         let oidc_base = OIDC_BASE_FMT.replace("{region}", region);
         let (client_id, client_secret) = register_client(http, &oidc_base, start_url).await?;
 
@@ -83,6 +102,7 @@ impl KiroSsoLoginStore {
                 start_url: start_url.to_string(),
                 proxy_url: proxy_url.to_string(),
                 email_hint,
+                provider: provider.to_string(),
                 created: Instant::now(),
             },
         );
@@ -114,11 +134,12 @@ async fn register_client(
     start_url: &str,
 ) -> Result<(String, String)> {
     let body = json!({
-        "clientName": "cool_proxy",
+        "clientName": "Kiro IDE",
         "clientType": "public",
         "scopes": SCOPES,
         "grantTypes": ["authorization_code", "refresh_token"],
-        "redirectUris": [REDIRECT_URI],
+        // 注册必须用不带端口的 redirect_uri，才能拿到带 REFRESH_TOKEN grant 的 client。
+        "redirectUris": [REGISTER_REDIRECT_URI],
         "issuerUrl": start_url,
     });
     let resp = http
@@ -133,6 +154,11 @@ async fn register_client(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        if status.as_u16() == 400 && text.to_ascii_lowercase().contains("invalid start url provided") {
+            anyhow::bail!(
+                "Start URL 无效。请检查 IAM Identity Center Start URL 是否正确。示例：https://d-1234567890.awsapps.com/start"
+            );
+        }
         anyhow::bail!(
             "client/register 失败 status={status} body={}",
             text.chars().take(512).collect::<String>()
@@ -171,7 +197,6 @@ fn build_authorize_url(oidc_base: &str, client_id: &str, state: &str, challenge:
             ("code_challenge_method", "S256"),
         ],
     ) {
-        // 参数全部受控，正常不会失败。
         Ok(u) => u.to_string(),
         Err(_) => format!(
             "{endpoint}?response_type=code&client_id={client_id}&redirect_uri={REDIRECT_URI}\
@@ -180,7 +205,7 @@ fn build_authorize_url(oidc_base: &str, client_id: &str, state: &str, challenge:
     }
 }
 
-/// 第二步：用授权码换 token，返回原始 token JSON（`{accessToken, refreshToken, expiresIn}`）。
+/// 第二步：用授权码换 token，返回原始 token JSON（`{accessToken, refreshToken, expiresIn, ...}`）。
 pub async fn exchange_code(
     http: &reqwest::Client,
     pending: &PendingKiroSso,

@@ -160,7 +160,10 @@ function statusInfo(row: KiroAccountView): {
 }
 
 function providerLabel(row: KiroAccountView): string {
-  return row.login_provider ?? (row.auth_method === 'idc' ? 'IdC' : '-')
+  // 显式 provider 优先（Google / Github / BuilderId / Enterprise）。
+  if (row.provider && row.provider.trim()) return row.provider
+  if (row.login_provider) return row.login_provider
+  return row.auth_method === 'IdC' ? 'IdC' : '-'
 }
 
 function proxyOptionsFor(row: KiroAccountView) {
@@ -337,9 +340,10 @@ async function submitPaste() {
   }
 }
 
-// ===== 企业 SSO（AWS IAM Identity Center / Start URL）登录 =====
+// ===== SSO（AWS IAM Identity Center / Builder ID）登录 =====
 const showSso = ref(false)
 const ssoStep = ref<1 | 2>(1)
+const ssoProvider = ref<'BuilderId' | 'Enterprise'>('Enterprise')
 const ssoProxyId = ref('__direct__')
 const ssoStartUrl = ref('')
 const ssoRegion = ref('us-east-1')
@@ -348,6 +352,11 @@ const ssoAuthUrl = ref('')
 const ssoState = ref('')
 const ssoCode = ref('')
 const ssoBusy = ref(false)
+
+const ssoProviderOptions = [
+  { label: 'BuilderId（个人 AWS Builder ID）', value: 'BuilderId' },
+  { label: 'Enterprise（组织 IAM Identity Center）', value: 'Enterprise' },
+]
 
 const ssoProxyOptions = computed(() => [
   { label: '直连', value: '__direct__' },
@@ -359,6 +368,7 @@ const ssoProxyOptions = computed(() => [
 
 function openSso() {
   ssoStep.value = 1
+  ssoProvider.value = 'Enterprise'
   ssoProxyId.value = '__direct__'
   ssoStartUrl.value = ''
   ssoRegion.value = 'us-east-1'
@@ -370,16 +380,20 @@ function openSso() {
 }
 
 async function startSso() {
+  // BuilderId 不需要填 Start URL（后端会用默认值），Enterprise 必须填。
   const startUrl = ssoStartUrl.value.trim()
-  if (!startUrl.startsWith('https://')) {
-    message.warning('请填写以 https:// 开头的 Start URL')
-    return
+  if (ssoProvider.value === 'Enterprise') {
+    if (!startUrl.startsWith('https://')) {
+      message.warning('Enterprise 登录需要填写以 https:// 开头的 Start URL')
+      return
+    }
   }
   ssoBusy.value = true
   try {
     const proxyId = ssoProxyId.value === '__direct__' ? '' : ssoProxyId.value
     const res = await kiroSsoLoginStart({
-      start_url: startUrl,
+      provider: ssoProvider.value,
+      start_url: startUrl || undefined,
       region: ssoRegion.value.trim() || 'us-east-1',
       proxy_id: proxyId,
       email: ssoEmail.value.trim() || undefined,
@@ -455,7 +469,7 @@ async function copySsoUrl() {
             <n-button type="primary">上传认证文件</n-button>
           </n-upload>
           <n-button @click="openPaste">粘贴 JSON</n-button>
-          <n-button @click="openSso">企业 SSO 登录</n-button>
+          <n-button @click="openSso">SSO 登录</n-button>
           <n-button @click="doRefreshPageQuota" :loading="bulkQuotaLoading">刷新本页额度</n-button>
           <n-button @click="() => refresh({ autoQuota: true })" :loading="loading">手动刷新</n-button>
         </n-space>
@@ -571,15 +585,27 @@ async function copySsoUrl() {
     <n-modal
       v-model:show="showSso"
       preset="card"
-      title="企业 SSO 登录（IAM Identity Center）"
+      title="SSO 登录（Builder ID / IAM Identity Center）"
       style="width: 720px"
     >
       <n-space vertical :size="12">
         <n-alert type="info" :show-icon="false">
-          用组织的 SSO Start URL 登录企业 Kiro 账号。第 1 步填 Start URL + 区域获取授权链接；
-          第 2 步自行在浏览器打开链接完成组织授权，再把回调地址栏里的内容（含
+          支持两种 AWS SSO 登录：<br />
+          <b>BuilderId</b> —— 个人账号，无需 Start URL（默认 view.awsapps.com/start）。<br />
+          <b>Enterprise</b> —— 组织账号，需要填组织 Start URL（形如 https://d-xxx.awsapps.com/start）。<br />
+          流程：第 1 步选 provider + 区域获取授权链接；第 2 步在浏览器完成授权后把回调地址栏（含
           <code>code=</code>）整段粘回。
         </n-alert>
+
+        <div>
+          <div class="sso-label">登录类型</div>
+          <n-select
+            v-model:value="ssoProvider"
+            :options="ssoProviderOptions"
+            :disabled="ssoStep === 2"
+            size="small"
+          />
+        </div>
 
         <div>
           <div class="sso-label">代理</div>
@@ -593,11 +619,19 @@ async function copySsoUrl() {
         </div>
 
         <template v-if="ssoStep === 1">
-          <div>
-            <div class="sso-label">SSO Start URL</div>
+          <div v-if="ssoProvider === 'Enterprise'">
+            <div class="sso-label">SSO Start URL（Enterprise 必填）</div>
             <n-input
               v-model:value="ssoStartUrl"
-              placeholder="https://your-org.awsapps.com/start"
+              placeholder="https://d-xxxxxxxxxx.awsapps.com/start"
+              clearable
+            />
+          </div>
+          <div v-else>
+            <div class="sso-label">SSO Start URL（BuilderId 选填，留空走默认）</div>
+            <n-input
+              v-model:value="ssoStartUrl"
+              placeholder="https://view.awsapps.com/start （可留空）"
               clearable
             />
           </div>
@@ -607,7 +641,7 @@ async function copySsoUrl() {
           </div>
           <div>
             <div class="sso-label">邮箱 / 备注（可选，用于识别与去重）</div>
-            <n-input v-model:value="ssoEmail" placeholder="可填该企业账号邮箱" clearable />
+            <n-input v-model:value="ssoEmail" placeholder="可填该账号邮箱" clearable />
           </div>
           <n-space justify="end">
             <n-button @click="showSso = false">取消</n-button>

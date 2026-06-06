@@ -1,6 +1,10 @@
-//! Kiro 账号池。镜像 `AccountPool` 的"DB 主 + 内存 ID 索引"模式，
-//! 去掉 codex 专有的 model_states，保留 enabled / cooldown / 统计 / 代理绑定。
-//! 本期只做账号池管理，pick 逻辑预留给后续反代 API 用。
+//! Kiro 账号池。镜像 `AccountPool` 的"DB 主 + 内存 ID 索引"模式。
+//!
+//! 与 KAM 一致点：
+//!  - `pick` 选号时跳过 banned/invalid/capped 状态（is_available 已统一逻辑）。
+//!  - SelectedKiroAccount 带 provider/machine_id —— 反代调用 generateAssistantResponse
+//!    时按 provider 决定 user-agent + agent-mode（IdC = vibe，social = spec）。
+//!  - resolve_profile_arn：social/BuilderId 用真实可用的默认 ARN，Enterprise 不发 ARN。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -10,7 +14,11 @@ use chrono::Utc;
 use serde::Serialize;
 use tracing::info;
 
-use crate::auth::kiro::{derive_kiro_account_id, KiroTokenData};
+use crate::auth::kiro::{
+    derive_kiro_account_id, KiroTokenData, KIRO_PROVIDER_BUILDER_ID, KIRO_PROVIDER_ENTERPRISE,
+    KIRO_PROVIDER_GITHUB, KIRO_PROVIDER_GOOGLE,
+};
+use crate::auth::kiro_quota::{KIRO_BUILDER_ID_PROFILE_ARN, KIRO_SOCIAL_PROFILE_ARN};
 use crate::config::Config;
 use crate::store::kiro_accounts as store_kiro;
 use crate::store::kiro_accounts::{KiroAccountRow, KiroQuotaUpdate, KiroTokenUpdate};
@@ -29,47 +37,44 @@ pub enum KiroPoolError {
 pub struct SelectedKiroAccount {
     pub id: String,
     pub access_token: String,
-    pub profile_arn: String,
+    /// 发往上游的 profile_arn。Enterprise 为 None；其它为已规整的真实 ARN。
+    pub profile_arn: Option<String>,
+    pub provider: String,
     pub auth_method: String,
-    pub login_provider: Option<String>,
+    pub machine_id: Option<String>,
     pub proxy_url: String,
 }
 
-/// social 登录（Google/Github）共用的固定 profileArn（非占位，正常发送）。
-const KIRO_SOCIAL_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
-/// Builder-ID / 企业 IdC 的**占位** profileArn（属于另一个 AWS 账号）。它**不应**发往上游——
-/// 发送会让企业/IdC token 被判 "bearer token invalid"。仅作"无真实 profileArn"的标记，由
-/// 调用方用 [`is_placeholder_profile_arn`] 剔除。对齐 Kiro-account-manager v1.7.4。
-const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
-
-/// 是否为已知占位 profileArn（旧反代 / Kiro IDE 可能写入的脏数据）。占位 ARN 不发往上游。
-pub fn is_placeholder_profile_arn(arn: &str) -> bool {
-    arn.trim() == KIRO_BUILDER_ID_PLACEHOLDER_ARN
-}
-
-/// 解析账号上游用的 profileArn：账号自带的**真实（非占位）** ARN 优先，否则按登录方式兜底。
-/// 返回值可能是占位 ARN——调用方需用 [`is_placeholder_profile_arn`] 判断后决定是否发送。
-pub fn resolve_profile_arn(acc: &KiroAccountRow) -> String {
-    if let Some(arn) = acc.profile_arn.as_deref() {
-        let arn = arn.trim();
-        if !arn.is_empty() && !is_placeholder_profile_arn(arn) {
-            return arn.to_string();
-        }
-    }
-    let provider = acc
-        .login_provider
+/// 解析 generateAssistantResponse 调用要发的 profile_arn。
+///
+///  - **Google / Github（social）**：账号自带 ARN > Social 默认 ARN。永远要发。
+///  - **BuilderId（IdC）**：账号自带 ARN > BuilderId 默认 ARN。永远要发（这是真实可用值）。
+///  - **Enterprise（IdC）**：返回 None —— Enterprise 账号的 profile 由上游按 token 推断，
+///    传别的 ARN 会让 token 被判 invalid。
+pub fn resolve_profile_arn_for_upstream(acc: &KiroAccountRow) -> Option<String> {
+    let account_arn = acc
+        .profile_arn
         .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if provider == "github" || provider == "google" {
-        KIRO_SOCIAL_PROFILE_ARN.to_string()
-    } else if acc.auth_method.eq_ignore_ascii_case("idc") {
-        KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()
-    } else {
-        // 默认按 social 兜底（大多数导入账号是社交登录）
-        KIRO_SOCIAL_PROFILE_ARN.to_string()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match acc.provider.as_str() {
+        KIRO_PROVIDER_GOOGLE | KIRO_PROVIDER_GITHUB => Some(
+            account_arn
+                .map(str::to_string)
+                .unwrap_or_else(|| KIRO_SOCIAL_PROFILE_ARN.to_string()),
+        ),
+        KIRO_PROVIDER_BUILDER_ID => Some(
+            account_arn
+                .map(str::to_string)
+                .unwrap_or_else(|| KIRO_BUILDER_ID_PROFILE_ARN.to_string()),
+        ),
+        KIRO_PROVIDER_ENTERPRISE => None,
+        // 兜底：旧账号没 provider 时按 social
+        _ => Some(
+            account_arn
+                .map(str::to_string)
+                .unwrap_or_else(|| KIRO_SOCIAL_PROFILE_ARN.to_string()),
+        ),
     }
 }
 
@@ -90,8 +95,13 @@ impl KiroPool {
         }
     }
 
-    /// 启动时刷新内存 ID 索引。
+    /// 启动时刷新内存 ID 索引；同时一次性回填旧库的 provider 字段。
     pub fn load(&self) -> anyhow::Result<usize> {
+        match store_kiro::backfill_provider(&self.db) {
+            Ok(n) if n > 0 => info!("kiro pool: backfilled provider for {n} legacy account(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("kiro provider backfill failed: {e:?}"),
+        }
         let ids = store_kiro::all_ids_sorted(&self.db)?;
         let n = ids.len();
         *self.ids.write().unwrap() = ids;
@@ -126,7 +136,7 @@ impl KiroPool {
         self.ids.read().unwrap().clone()
     }
 
-    /// round-robin 选一个可用账号（账号级 cooldown / enabled 过滤）。给反代用。
+    /// round-robin 选一个可用账号。给反代用。
     pub fn pick(&self) -> Result<SelectedKiroAccount, KiroPoolError> {
         let now = Utc::now();
         let ids = self.ids.read().unwrap();
@@ -145,18 +155,14 @@ impl KiroPool {
                 continue;
             }
             let _ = store_kiro::mark_used(&self.db, id);
-            // 占位 profileArn 不发给上游（与 Kiro-account-manager v1.7.4 一致：发送占位 ARN
-            // 会让企业/IdC token 被判 invalid）。剥成空串，build_payload 会省略 profileArn 字段。
-            let mut profile_arn = resolve_profile_arn(&a);
-            if is_placeholder_profile_arn(&profile_arn) {
-                profile_arn.clear();
-            }
+            let profile_arn = resolve_profile_arn_for_upstream(&a);
             return Ok(SelectedKiroAccount {
                 id: a.id,
                 access_token: a.access_token,
                 profile_arn,
+                provider: a.provider,
                 auth_method: a.auth_method,
-                login_provider: a.login_provider,
+                machine_id: a.machine_id,
                 proxy_url: a.proxy_url,
             });
         }
@@ -168,7 +174,7 @@ impl KiroPool {
         let _ = store_kiro::report_success(&self.db, id);
     }
 
-    /// 失败上报：按配置决定是否冷却。返回是否进入了冷却（仅用于日志）。
+    /// 失败上报：按配置决定是否冷却。
     pub fn report_failure_for(&self, id: &str, msg: &str) {
         if self.cfg.retry.disable_cooldown {
             let _ = store_kiro::mark_refresh_failed(&self.db, id, msg);
@@ -184,23 +190,33 @@ impl KiroPool {
         );
     }
 
-    /// 标记账号被封禁（403 + SUSPENDED 之类），写 status + 禁用避免反复命中。
+    /// 标记账号被封禁（403/423 + SUSPENDED 之类）。
     pub fn mark_banned(&self, id: &str, reason: &str) {
-        let _ = store_kiro::set_enabled(&self.db, id, false);
-        let q = crate::store::kiro_accounts::KiroQuotaUpdate {
+        let q = KiroQuotaUpdate {
             status: Some(crate::auth::kiro::KIRO_STATUS_BANNED.to_string()),
             status_reason: Some(reason.to_string()),
             quota_error: Some(reason.to_string()),
             raw_usage: None,
+            usage_data: None,
             ..Default::default()
         };
         let _ = store_kiro::update_quota(&self.db, id, &q);
+        // update_quota 已经按 status='banned' 自动禁用账号 —— 不再额外调 set_enabled。
     }
 
-    /// 导入 / 替换一个账号。自动派生稳定 id。
+    /// 标记 token invalid（refresh_token 失效，无法自救）。
+    pub fn mark_token_invalid(&self, id: &str, reason: &str) {
+        let _ = store_kiro::mark_token_invalid(&self.db, id, reason);
+    }
+
+    /// 导入 / 替换一个账号。自动派生稳定 id；缺 machine_id 时生成 uuid。
     pub fn add_or_replace(&self, data: &KiroTokenData) -> anyhow::Result<KiroAccountRow> {
         let id = derive_kiro_account_id(data);
-        let row = KiroAccountRow::from_token_data(id.clone(), data);
+        let mut row = KiroAccountRow::from_token_data(id.clone(), data);
+        // 没绑过 machine_id 就生成一个稳定 uuid，与 KAM 行为一致。
+        if row.machine_id.as_deref().map(str::is_empty).unwrap_or(true) {
+            row.machine_id = Some(uuid::Uuid::new_v4().to_string().to_lowercase());
+        }
         store_kiro::upsert(&self.db, &row)?;
         self.refresh_ids()?;
         store_kiro::get(&self.db, &id)?

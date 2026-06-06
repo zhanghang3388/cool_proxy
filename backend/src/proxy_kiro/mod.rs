@@ -118,7 +118,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
         last_account = Some(selected.id.clone());
 
         // 翻译请求（每次重试都重建，conversationId/continuationId 会刷新，没问题）
-        let translated = match translator::translate(&raw, &selected.profile_arn) {
+        let translated = match translator::translate(&raw, selected.profile_arn.as_deref().unwrap_or("")) {
             Ok(t) => t,
             Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e),
         };
@@ -148,6 +148,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
                 &translated.payload,
                 &selected.access_token,
                 &selected.auth_method,
+                selected.machine_id.as_deref(),
                 &selected.proxy_url,
             )
             .await

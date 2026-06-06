@@ -35,15 +35,26 @@ const AGENT_MODE_SPEC: &str = "spec";
 /// CLI 模式（IdC 账号）。
 const AGENT_MODE_VIBE: &str = "vibe";
 
-fn kiro_user_agent() -> String {
-    format!(
-        "aws-sdk-js/{AWS_SDK_VERSION} ua/2.1 os/win32#10.0.19045 lang/js md/nodejs#22.22.0 \
-         api/codewhispererstreaming#{AWS_SDK_VERSION} m/E KiroIDE-{KIRO_VERSION}"
-    )
+fn kiro_user_agent(machine_id: &str) -> String {
+    if machine_id.is_empty() {
+        format!(
+            "aws-sdk-js/{AWS_SDK_VERSION} ua/2.1 os/win32#10.0.19045 lang/js md/nodejs#22.22.0 \
+             api/codewhispererstreaming#{AWS_SDK_VERSION} m/E KiroIDE-{KIRO_VERSION}"
+        )
+    } else {
+        format!(
+            "aws-sdk-js/{AWS_SDK_VERSION} ua/2.1 os/win32#10.0.19045 lang/js md/nodejs#22.22.0 \
+             api/codewhispererstreaming#{AWS_SDK_VERSION} m/E KiroIDE-{KIRO_VERSION}-{machine_id}"
+        )
+    }
 }
 
-fn kiro_amz_user_agent() -> String {
-    format!("aws-sdk-js/{AWS_SDK_VERSION} KiroIDE-{KIRO_VERSION}")
+fn kiro_amz_user_agent(machine_id: &str) -> String {
+    if machine_id.is_empty() {
+        format!("aws-sdk-js/{AWS_SDK_VERSION} KiroIDE-{KIRO_VERSION}")
+    } else {
+        format!("aws-sdk-js/{AWS_SDK_VERSION} KiroIDE-{KIRO_VERSION}-{machine_id}")
+    }
 }
 
 /// IdC / 企业账号在 generateAssistantResponse 上标识为 “Amazon Q for CLI”（aws-sdk-rust），
@@ -59,18 +70,21 @@ pub async fn call_kiro(
     payload: &KiroPayload,
     access_token: &str,
     auth_method: &str,
+    machine_id: Option<&str>,
     proxy_url: &str,
 ) -> Result<Response> {
     let is_idc = auth_method.eq_ignore_ascii_case("idc");
     let agent_mode = if is_idc { AGENT_MODE_VIBE } else { AGENT_MODE_SPEC };
     // IdC/企业账号用 Amazon Q for CLI 标识，social 用 KiroIDE 标识。
+    // KiroIDE 标识带账号稳定 machineId，与 KAM `build_kiro_custom_user_agent` 一致。
     let (user_agent, amz_user_agent) = if is_idc {
         (
             KIRO_CLI_USER_AGENT.to_string(),
             KIRO_CLI_AMZ_USER_AGENT.to_string(),
         )
     } else {
-        (kiro_user_agent(), kiro_amz_user_agent())
+        let mid = machine_id.map(str::trim).unwrap_or("");
+        (kiro_user_agent(mid), kiro_amz_user_agent(mid))
     };
 
     let body = serde_json::to_vec(payload).context("serialize kiro payload")?;

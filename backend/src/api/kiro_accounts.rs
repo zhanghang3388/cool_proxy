@@ -1,5 +1,10 @@
-//! Kiro 账号池的管理面板接口。镜像 `api/accounts.rs`，字段换成 Kiro 集合。
-//! 本期只做账号池管理：列表 / 导入 / 上传 / 启停 / 删除 / 绑代理 / 刷新 token / 查额度。
+//! Kiro 账号池的管理面板接口。镜像 `api/accounts.rs`，字段集与 KAM 对齐。
+//!
+//! 与之前接口的差异：
+//!  - 列表 view 多出 `provider`（显式 Google/Github/BuilderId/Enterprise）、
+//!    `client_id_hash`、`start_url`、`machine_id`、`disabled_reason`，前端可直接展示；
+//!  - 查额度走 KAM 风格：social/BuilderId 传默认 profileArn、Enterprise 跨区域探测；
+//!  - SSO 登录：在企业 Start URL 之外，新增 BuilderId（默认 view.awsapps.com/start）入口。
 
 use std::sync::Arc;
 
@@ -12,8 +17,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::auth::kiro::KiroTokenData;
-use crate::auth::kiro_quota::{banned_reason, fetch_kiro_usage, KiroUsageSnapshot};
+use crate::auth::kiro::{
+    auth_method_for_provider, KiroTokenData, KIRO_PROVIDER_BUILDER_ID, KIRO_PROVIDER_ENTERPRISE,
+};
+use crate::auth::kiro_quota::{
+    banned_reason, fetch_kiro_usage, is_auth_error_message as is_quota_auth_error,
+    KiroUsageSnapshot, UsageQuery,
+};
+use crate::auth::kiro_refresh::is_auth_error_message as is_refresh_auth_error;
 use crate::state::AppState;
 use crate::store::kiro_accounts::{KiroAccountRow, KiroQuotaUpdate};
 
@@ -40,6 +51,9 @@ pub struct KiroAccountView {
     pub id: String,
     pub email: String,
     pub user_id: Option<String>,
+    /// 显式 provider：Google / Github / BuilderId / Enterprise。
+    pub provider: String,
+    /// 兼容旧字段（与 provider 同值，前端逐步迁移）。
     pub login_provider: Option<String>,
     pub auth_method: String,
     pub enabled: bool,
@@ -47,8 +61,10 @@ pub struct KiroAccountView {
     pub last_refresh_at: Option<String>,
     pub last_used_at: Option<String>,
     pub failure_count: u32,
+    pub success_count: u64,
     pub cooldown_until: Option<String>,
     pub last_error: Option<String>,
+    pub disabled_reason: Option<String>,
     pub total_requests: u64,
     pub total_failures: u64,
     pub expired: bool,
@@ -56,6 +72,10 @@ pub struct KiroAccountView {
     pub proxy_id: Option<String>,
     pub status: Option<String>,
     pub status_reason: Option<String>,
+    pub start_url: Option<String>,
+    pub client_id_hash: Option<String>,
+    pub machine_id: Option<String>,
+    pub region: Option<String>,
     pub usage: KiroUsageView,
 }
 
@@ -106,7 +126,11 @@ fn usage_view(a: &KiroAccountRow) -> KiroUsageView {
     }
 }
 
-fn account_view(app: &Arc<AppState>, a: KiroAccountRow, now: chrono::DateTime<chrono::Utc>) -> KiroAccountView {
+fn account_view(
+    app: &Arc<AppState>,
+    a: KiroAccountRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> KiroAccountView {
     let usage = usage_view(&a);
     KiroAccountView {
         expired: a.expires_at.map(|t| t <= now).unwrap_or(true),
@@ -114,20 +138,27 @@ fn account_view(app: &Arc<AppState>, a: KiroAccountRow, now: chrono::DateTime<ch
         id: a.id,
         email: a.email,
         user_id: a.user_id,
-        login_provider: a.login_provider,
+        login_provider: Some(a.provider.clone()),
+        provider: a.provider,
         auth_method: a.auth_method,
         enabled: a.enabled,
         expire_at: a.expires_at.map(|t| t.to_rfc3339()),
         last_refresh_at: a.last_refresh_at.map(|t| t.to_rfc3339()),
         last_used_at: a.last_used_at.map(|t| t.to_rfc3339()),
         failure_count: a.failure_count,
+        success_count: a.success_count,
         cooldown_until: a.cooldown_until.map(|t| t.to_rfc3339()),
         last_error: a.last_error,
+        disabled_reason: a.disabled_reason,
         total_requests: a.total_requests,
         total_failures: a.total_failures,
         proxy_url: a.proxy_url,
         status: a.status,
         status_reason: a.status_reason,
+        start_url: a.start_url,
+        client_id_hash: a.client_id_hash,
+        machine_id: a.machine_id,
+        region: a.idc_region,
         usage,
     }
 }
@@ -249,7 +280,14 @@ pub async fn manual_refresh(State(app): State<Arc<AppState>>, Path(id): Path<Str
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            app.kiro_pool.mark_refresh_failed(&id, &msg);
+            // AUTH_ERROR + token 已过期 → 标记 invalid 而不仅仅记错误
+            let now = chrono::Utc::now();
+            let token_dead = acc.expires_at.map(|t| t <= now).unwrap_or(true);
+            if is_refresh_auth_error(&msg) && token_dead {
+                app.kiro_pool.mark_token_invalid(&id, &msg);
+            } else {
+                app.kiro_pool.mark_refresh_failed(&id, &msg);
+            }
             (StatusCode::BAD_GATEWAY, msg).into_response()
         }
     }
@@ -277,6 +315,7 @@ pub struct QuotaRefreshResp {
 }
 
 fn quota_update_from_snapshot(snapshot: KiroUsageSnapshot) -> KiroQuotaUpdate {
+    let raw_value = snapshot.raw.clone();
     KiroQuotaUpdate {
         plan_name: snapshot.plan_name,
         plan_tier: snapshot.plan_tier,
@@ -286,10 +325,12 @@ fn quota_update_from_snapshot(snapshot: KiroUsageSnapshot) -> KiroQuotaUpdate {
         bonus_used: snapshot.bonus_used,
         usage_reset_at: snapshot.usage_reset_at,
         bonus_expire_days: snapshot.bonus_expire_days,
-        status: Some(crate::auth::kiro::KIRO_STATUS_NORMAL.to_string()),
+        status: Some(snapshot.derived_status),
         status_reason: None,
-        raw_usage: Some(snapshot.raw),
+        raw_usage: Some(raw_value.clone()),
+        usage_data: Some(raw_value),
         quota_error: None,
+        detected_region: snapshot.detected_region,
     }
 }
 
@@ -304,7 +345,7 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
     };
 
     // 查额度前先确保 access_token 新鲜：过期/将过期的 token 会被上游判为
-    // "bearer token invalid"（与 Kiro-account-manager 一致——用前先刷新）。
+    // "bearer token invalid"（与 KAM 一致 —— 用前先刷新）。
     let stale = acc
         .expires_at
         .map(|e| e <= chrono::Utc::now() + chrono::Duration::seconds(60))
@@ -319,11 +360,17 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
                     }
                 }
                 Err(e) => {
-                    // token 已过期且刷新失败：直接把刷新错误暴露出来，而不是拿着死 token
-                    // 去查额度得到误导性的 "bearer token invalid"。
                     let msg = format!("token 刷新失败（查额度前）: {e:#}");
                     tracing::warn!(account = %id, "{msg}");
-                    app.kiro_pool.update_quota_error(&id, &msg);
+                    let token_dead = acc
+                        .expires_at
+                        .map(|t| t <= chrono::Utc::now())
+                        .unwrap_or(true);
+                    if is_refresh_auth_error(&msg) && token_dead {
+                        app.kiro_pool.mark_token_invalid(&id, &msg);
+                    } else {
+                        app.kiro_pool.update_quota_error(&id, &msg);
+                    }
                     let usage = app.kiro_pool.get(&id).map(|a| usage_view(&a));
                     return QuotaRefreshItem {
                         id,
@@ -336,15 +383,18 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
         }
     }
 
-    // 注意：getUsageLimits 不传 profileArn——Kiro-account-manager 所有调用点都传 undefined，
-    // 让上游按 token 自身身份推断 profile。传一个占位 profileArn（属于别的 AWS 账号）正是
-    // 企业 IdC token 被判 "bearer token invalid" 的根因。
+    // 按 provider 派发查询路径（Enterprise 多区域探测，其它单区域 + 默认 ARN）。
     let result = fetch_kiro_usage(
         &app.clients,
-        &acc.id,
-        &acc.access_token,
-        acc.idc_region.as_deref(),
-        &acc.proxy_url,
+        UsageQuery {
+            account_id: &acc.id,
+            access_token: &acc.access_token,
+            provider: &acc.provider,
+            idc_region: acc.idc_region.as_deref(),
+            profile_arn: acc.profile_arn.as_deref(),
+            machine_id: acc.machine_id.as_deref(),
+            proxy_url: &acc.proxy_url,
+        },
     )
     .await;
 
@@ -363,10 +413,47 @@ async fn refresh_one_quota(app: Arc<AppState>, id: String) -> QuotaRefreshItem {
                     status_reason: Some(reason.clone()),
                     quota_error: Some(reason.clone()),
                     raw_usage: None,
+                    usage_data: None,
                     ..Default::default()
                 };
                 app.kiro_pool.update_quota(&id, &banned);
                 (false, Some(format!("BANNED: {reason}")))
+            } else if is_quota_auth_error(&msg) {
+                // 401 后再 refresh 一次重试
+                if let Some(_guard) = app.kiro_refresher.begin_refresh(&id) {
+                    if let Ok(update) = app.kiro_refresher.refresh(&acc).await {
+                        app.kiro_pool.update_after_refresh(&id, &update);
+                        if let Some(fresh) = app.kiro_pool.get(&id) {
+                            acc = fresh;
+                        }
+                        if let Ok(snapshot) = fetch_kiro_usage(
+                            &app.clients,
+                            UsageQuery {
+                                account_id: &acc.id,
+                                access_token: &acc.access_token,
+                                provider: &acc.provider,
+                                idc_region: acc.idc_region.as_deref(),
+                                profile_arn: acc.profile_arn.as_deref(),
+                                machine_id: acc.machine_id.as_deref(),
+                                proxy_url: &acc.proxy_url,
+                            },
+                        )
+                        .await
+                        {
+                            app.kiro_pool
+                                .update_quota(&id, &quota_update_from_snapshot(snapshot));
+                            let usage = app.kiro_pool.get(&id).map(|a| usage_view(&a));
+                            return QuotaRefreshItem {
+                                id,
+                                ok: true,
+                                usage,
+                                error: None,
+                            };
+                        }
+                    }
+                }
+                app.kiro_pool.update_quota_error(&id, &msg);
+                (false, Some(msg))
             } else {
                 app.kiro_pool.update_quota_error(&id, &msg);
                 (false, Some(msg))
@@ -555,12 +642,22 @@ pub async fn upload(State(app): State<Arc<AppState>>, mut multipart: Multipart) 
     Json(body).into_response()
 }
 
-// ===== 企业 SSO（AWS IAM Identity Center / Start URL）登录 =====
+// ===== SSO（AWS IAM Identity Center / Builder ID）登录 =====
+//
+// 步骤一：调用 `oidc.{region}.amazonaws.com/client/register` 注册 OIDC 客户端，
+// 生成 PKCE + state，构造授权链接返回前端展示。
+// 步骤二：用户在浏览器自行完成授权，把回调 URL（含 `code=`）整段粘回，后端调用
+// `/token` 换出 access/refresh token，按 KAM 规则推断 provider（BuilderId vs Enterprise），
+// 自动算 client_id_hash、绑定代理、入池。
 
 #[derive(Deserialize)]
 pub struct SsoLoginStartPayload {
-    /// 组织 SSO Start URL，例如 https://your-org.awsapps.com/start
-    pub start_url: String,
+    /// 组织 SSO Start URL，例如 https://your-org.awsapps.com/start。留空走 BuilderId 默认值。
+    #[serde(default)]
+    pub start_url: Option<String>,
+    /// 想要登录的 provider —— 默认按 start_url 推断。
+    #[serde(default)]
+    pub provider: Option<String>,
     /// AWS 区域，缺省 us-east-1。
     #[serde(default)]
     pub region: Option<String>,
@@ -569,7 +666,7 @@ pub struct SsoLoginStartPayload {
     pub proxy_id: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
-    /// 可选：邮箱/备注，用于生成稳定账号 id（便于重复登录覆盖同一行）。
+    /// 可选：邮箱/备注，用于生成稳定账号 id。
     #[serde(default)]
     pub email: Option<String>,
 }
@@ -580,12 +677,54 @@ pub struct SsoLoginStartResp {
     pub state: String,
 }
 
-/// 第一步：注册 OIDC 客户端并返回授权链接（展示在页面，由用户手动打开完成组织授权）。
+/// 第一步：注册 OIDC 客户端并返回授权链接。
 pub async fn sso_login_start(
     State(app): State<Arc<AppState>>,
     Json(payload): Json<SsoLoginStartPayload>,
 ) -> Response {
-    let start_url = payload.start_url.trim().to_string();
+    // 推断 provider + start_url：用户给了 start_url 就遵守它（落到 BuilderId 默认 url
+    // 视为 BuilderId 登录）；没给 url 但显式选了 BuilderId，则用 BuilderId 默认 url。
+    let normalized_provider = payload
+        .provider
+        .as_deref()
+        .and_then(crate::auth::kiro::normalize_provider_name);
+    let explicit_url = payload
+        .start_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let (provider, start_url) = match (normalized_provider.as_deref(), explicit_url) {
+        (Some(KIRO_PROVIDER_BUILDER_ID), None) => (
+            KIRO_PROVIDER_BUILDER_ID.to_string(),
+            crate::auth::kiro::KIRO_BUILDER_ID_START_URL.to_string(),
+        ),
+        (Some(p), Some(url)) => (p.to_string(), url.to_string()),
+        (Some(KIRO_PROVIDER_ENTERPRISE), None) => {
+            return (StatusCode::BAD_REQUEST, "Enterprise 登录必须填写 Start URL").into_response();
+        }
+        (None, Some(url)) => {
+            // 推断 provider
+            let p = if crate::auth::kiro::is_builder_id_start_url(url) {
+                KIRO_PROVIDER_BUILDER_ID.to_string()
+            } else {
+                KIRO_PROVIDER_ENTERPRISE.to_string()
+            };
+            (p, url.to_string())
+        }
+        (None, None) => (
+            KIRO_PROVIDER_BUILDER_ID.to_string(),
+            crate::auth::kiro::KIRO_BUILDER_ID_START_URL.to_string(),
+        ),
+        (Some(_other), None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Social 登录暂不支持 SSO 流程，请走『粘贴 JSON』导入",
+            )
+                .into_response();
+        }
+    };
+
     if !start_url.starts_with("https://") {
         return (StatusCode::BAD_REQUEST, "Start URL 必须以 https:// 开头").into_response();
     }
@@ -597,7 +736,6 @@ pub async fn sso_login_start(
         .unwrap_or("us-east-1")
         .to_string();
 
-    // 解析代理（用于 register/authorize/token 及绑定到账号，全程同一出口）。
     let proxy_url = if let Some(pid) = payload.proxy_id.as_deref().filter(|s| !s.is_empty()) {
         match app.proxy_pool.url_by_id(pid) {
             Some(u) => u,
@@ -621,7 +759,14 @@ pub async fn sso_login_start(
 
     match app
         .kiro_login
-        .start(&http, &start_url, &region, &proxy_url, email_hint)
+        .start(
+            &http,
+            &provider,
+            &start_url,
+            &region,
+            &proxy_url,
+            email_hint,
+        )
         .await
     {
         Ok((auth_url, state)) => Json(SsoLoginStartResp { auth_url, state }).into_response(),
@@ -635,12 +780,11 @@ pub struct SsoLoginFinishPayload {
     pub code: String,
 }
 
-/// 第二步：回填授权码，换 token 并入池（自动判成 idc / 企业账号）。
+/// 第二步：回填授权码，换 token 并入池。
 pub async fn sso_login_finish(
     State(app): State<Arc<AppState>>,
     Json(payload): Json<SsoLoginFinishPayload>,
 ) -> Response {
-    // peek 不消费：换 token 失败时保留上下文，便于用户改正授权码后重试。
     let Some(pending) = app.kiro_login.peek(&payload.state) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -658,21 +802,29 @@ pub async fn sso_login_finish(
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
     };
-    // 换 token 成功，消费掉这次登录的 state。
     app.kiro_login.remove(&payload.state);
 
-    // 把 token 响应与登录时收集的 IdC 元数据合并，交给统一解析；detect_idc 会判成 idc。
+    // 推断 provider：以 pending 里记录的为主（start_url 在 KIM 阶段就分类好了）。
+    let provider = pending.provider.clone();
+    let auth_method = auth_method_for_provider(&provider);
+    let normalized_url = crate::auth::kiro::normalize_start_url(&pending.start_url);
+    let client_id_hash = crate::auth::kiro::calculate_client_id_hash(&normalized_url);
+
     let merged = json!({
         "accessToken": token.get("accessToken").or_else(|| token.get("access_token")),
         "refreshToken": token.get("refreshToken").or_else(|| token.get("refresh_token")),
         "expiresIn": token.get("expiresIn").or_else(|| token.get("expires_in")),
+        "idToken": token.get("idToken").or_else(|| token.get("id_token")),
+        "aws_sso_app_session_id": token.get("aws_sso_app_session_id"),
         "clientId": pending.client_id,
         "clientSecret": pending.client_secret,
         "idcRegion": pending.region,
         "region": pending.region,
         "issuerUrl": pending.start_url,
-        "authMethod": "idc",
-        "provider": "enterprise",
+        "startUrl": normalized_url,
+        "client_id_hash": client_id_hash,
+        "authMethod": auth_method,
+        "provider": provider,
         "email": pending.email_hint,
     });
 
@@ -691,7 +843,6 @@ pub async fn sso_login_finish(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    // 绑定代理：登录时选了就用它，否则自动分配一个。
     if !pending.proxy_url.trim().is_empty() {
         let _ = app.kiro_pool.set_proxy(&acc.id, pending.proxy_url.clone());
     } else if acc.proxy_url.trim().is_empty() {
@@ -700,7 +851,7 @@ pub async fn sso_login_finish(
         }
     }
 
-    info!(account = %acc.id, email = %acc.email, "kiro account added via enterprise sso");
+    info!(account = %acc.id, email = %acc.email, provider = %acc.provider, "kiro account added via sso");
     let now = chrono::Utc::now();
     let fresh = app.kiro_pool.get(&acc.id).unwrap_or(acc);
     let view = account_view(&app, fresh, now);
