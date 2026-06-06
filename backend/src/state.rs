@@ -29,6 +29,8 @@ pub struct AppState {
     pub kiro_login: Arc<KiroSsoLoginStore>,
     pub claude_models_cache: Arc<crate::proxy_claude::ModelsCache>,
     pub request_log: Arc<RequestLog>,
+    /// kiro 反代合成 prompt-cache 计费的前缀指纹表（带 TTL）。
+    pub kiro_prompt_cache: Arc<crate::proxy_kiro::cache_synth::PromptCacheStore>,
 }
 
 impl AppState {
@@ -56,6 +58,8 @@ impl AppState {
         let kiro_login = Arc::new(KiroSsoLoginStore::new());
         let claude_models_cache = Arc::new(crate::proxy_claude::ModelsCache::new());
         let request_log = Arc::new(RequestLog::new(db.clone()));
+        let kiro_prompt_cache =
+            Arc::new(crate::proxy_kiro::cache_synth::PromptCacheStore::default());
 
         Ok(Self {
             config,
@@ -72,6 +76,7 @@ impl AppState {
             kiro_login,
             claude_models_cache,
             request_log,
+            kiro_prompt_cache,
         })
     }
 }

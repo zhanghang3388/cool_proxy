@@ -2,6 +2,7 @@
 //! 翻译成 Kiro `generateAssistantResponse` 转发到上游，把上游 event-stream 反向翻译成
 //! Anthropic SSE（流式）或单个 message JSON（非流式）。复用账号池 / 代理池 / 请求日志。
 
+pub mod cache_synth;
 pub mod eventstream;
 pub mod payload;
 pub mod prompt_filter;
@@ -150,6 +151,20 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
     }
     let client_wants_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // 合成 prompt-cache 计费：按 CC 自带的 cache_control 断点算前缀命中（只算一次，避免
+    // 重试时重复登记）。后面在拿到上游真实 input 总量后，据此把它拆成 read/creation/fresh。
+    let synth_cache: Option<(cache_synth::CachePlan, u32)> = if app.config.kiro.synth_cache {
+        let plan = cache_synth::build_plan(&raw);
+        if plan.is_empty() {
+            None
+        } else {
+            let hit = app.kiro_prompt_cache.lookup_and_record(&plan);
+            Some((plan, hit))
+        }
+    } else {
+        None
+    };
+
     let max_attempts = app.config.retry.max_retries.max(1);
     let started = Instant::now();
     let log_path = "/kiro/v1/messages";
@@ -284,6 +299,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
                 parts.method.clone(),
                 attempt + 1,
                 started,
+                synth_cache.clone(),
             );
         } else {
             return aggregate_response(
@@ -295,6 +311,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
                 parts.method.clone(),
                 attempt + 1,
                 started,
+                synth_cache.clone(),
             )
             .await;
         }
@@ -370,6 +387,35 @@ async fn read_snippet(resp: reqwest::Response) -> String {
     collapsed.trim().chars().take(400).collect()
 }
 
+/// 用合成缓存计划把 `total_input` 拆成 `(fresh_input, cache_read, cache_creation)`。
+/// 未启用 / 无断点 / 无 input 时返回 `(total_input, 0, 0)`（即不合成，全 fresh）。
+fn synth_split(
+    total_input: i64,
+    synth: &Option<(cache_synth::CachePlan, u32)>,
+) -> (i64, i64, i64) {
+    match synth {
+        Some((plan, hit)) if !plan.is_empty() && total_input > 0 => {
+            let s = cache_synth::split_usage(total_input, *hit, plan);
+            (s.fresh_input, s.cache_read, s.cache_creation)
+        }
+        _ => (total_input, 0, 0),
+    }
+}
+
+/// 把合成缓存拆分写回 KiroUsage（input_tokens 变成 fresh 部分，cache 字段填上）。
+/// 返回拆分前的真实 input 总量，供请求日志记录真实总数。
+fn apply_synth_split(
+    usage: &mut response::KiroUsage,
+    synth: &Option<(cache_synth::CachePlan, u32)>,
+) -> i64 {
+    let total = usage.input_tokens;
+    let (fresh, read, create) = synth_split(total, synth);
+    usage.input_tokens = fresh;
+    usage.cache_read_tokens = read;
+    usage.cache_write_tokens = create;
+    total
+}
+
 /// 流式：边收上游 event-stream，边发 Anthropic SSE。
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
@@ -382,6 +428,7 @@ fn stream_response(
     method: Method,
     attempt_count: u32,
     started: Instant,
+    synth: Option<(cache_synth::CachePlan, u32)>,
 ) -> Response {
     use futures_util::StreamExt;
 
@@ -395,7 +442,12 @@ fn stream_response(
         let mut upstream = resp.bytes_stream();
         let mut stream_err: Option<String> = None;
 
-        yield Ok::<_, std::io::Error>(bytes::Bytes::from(encoder.start(input_est)));
+        // message_start 的 usage：合成缓存按字节估算先拆一份（cool_api 从 message_start
+        // 读取 input/cache 计费），真实总量到流末再在 message_delta 里以真值重拆。
+        let (start_input, start_read, start_create) = synth_split(input_est, &synth);
+        yield Ok::<_, std::io::Error>(bytes::Bytes::from(
+            encoder.start(start_input, start_read, start_create),
+        ));
 
         // 每 20s 发一个 ping 保活。Claude Code 的首条请求（大 system prompt + 一堆工具）
         // 上游首 token 可能很久，期间若长时间无字节，CC 会把连接当作 stalled 而断开。
@@ -451,7 +503,9 @@ fn stream_response(
                 yield Ok(bytes::Bytes::from(sse));
             }
         }
-        let usage = proc.usage.clone();
+        let mut usage = proc.usage.clone();
+        // 用上游真实 input 总量重算合成缓存拆分，写进 message_delta 的 usage。
+        let real_input = apply_synth_split(&mut usage, &synth);
         let stop_override = proc.stop_reason_override();
         yield Ok(bytes::Bytes::from(encoder.finish(&usage, stop_override)));
 
@@ -465,7 +519,8 @@ fn stream_response(
         } else {
             pool.report_failure_for(&report_acct, stream_err.as_deref().unwrap_or("stream error"));
         }
-        let total = usage.input_tokens + usage.output_tokens;
+        // 日志记真实总 input（合成拆分只影响计费字段，不改变真实消耗）。
+        let total = real_input + usage.output_tokens;
         log.push(
             &method,
             "/kiro/v1/messages",
@@ -474,7 +529,7 @@ fn stream_response(
             status_code,
             started.elapsed().as_millis() as u64,
             attempt_count,
-            Some(usage.input_tokens),
+            Some(real_input),
             Some(usage.output_tokens),
             Some(total),
             err_msg,
@@ -507,6 +562,7 @@ async fn aggregate_response(
     method: Method,
     attempt_count: u32,
     started: Instant,
+    synth: Option<(cache_synth::CachePlan, u32)>,
 ) -> Response {
     use futures_util::StreamExt;
 
@@ -544,7 +600,7 @@ async fn aggregate_response(
         }
     }
     events.extend(proc.finalize());
-    let usage = proc.usage.clone();
+    let mut usage = proc.usage.clone();
     let stop_override = proc.stop_reason_override();
 
     // 上游在 200 之后于流内报错：按失败上报 + 记日志 + 回 502，
@@ -567,8 +623,11 @@ async fn aggregate_response(
         return anthropic_error(StatusCode::BAD_GATEWAY, &err);
     }
 
+    // 非流式有真实总量，直接以真值做合成缓存拆分。
+    let real_input = apply_synth_split(&mut usage, &synth);
+
     app.kiro_pool.report_success_for(&account_id);
-    let total = usage.input_tokens + usage.output_tokens;
+    let total = real_input + usage.output_tokens;
     app.request_log.push(
         &method,
         "/kiro/v1/messages",
@@ -577,7 +636,7 @@ async fn aggregate_response(
         200,
         started.elapsed().as_millis() as u64,
         attempt_count,
-        Some(usage.input_tokens),
+        Some(real_input),
         Some(usage.output_tokens),
         Some(total),
         None,

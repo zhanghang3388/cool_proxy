@@ -44,4 +44,9 @@ kiro:
   # 去掉环境/身份噪音行（gitStatus / Recent commits / knowledge cutoff /
   # "you are claude code" / # Environment 段等）。默认开。
   env_noise: true
+  # 合成 prompt-cache 计费：Kiro 上游不支持缓存（且按月请求数限额、不按 token 计费），
+  # 此项按 Claude Code 自带的 cache_control 断点，把上游真实 input 拆成
+  # cache_read / cache_creation / fresh 写入 usage，让下游（如 cool_api）像 claude
+  # 渠道一样按缓存计费。只「拆分」真实总量、绝不放大，默认开。
+  synth_cache: true
 

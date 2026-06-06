@@ -34,6 +34,12 @@ pub struct KiroConfig {
     /// "you are claude code" / # Environment 段等）。默认开。
     #[serde(default = "default_true")]
     pub env_noise: bool,
+    /// 合成 prompt-cache 计费：Kiro 上游不支持缓存，但按月请求数限额（不按 token 计费），
+    /// 故按 Claude Code 自带的 cache_control 断点，把上游真实 input 拆成 cache_read /
+    /// cache_creation / fresh 写入 usage，让下游（cool_api）像 claude 渠道一样按缓存计费。
+    /// 只「拆分」真实总量、不放大，默认开。
+    #[serde(default = "default_true")]
+    pub synth_cache: bool,
 }
 
 fn default_true() -> bool {
@@ -46,6 +52,7 @@ impl Default for KiroConfig {
             filter_claude_code: false,
             strip_boundaries: true,
             env_noise: true,
+            synth_cache: true,
         }
     }
 }

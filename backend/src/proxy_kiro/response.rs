@@ -333,9 +333,19 @@ impl ClaudeSseEncoder {
         format!("event: {event}\ndata: {data}\n\n")
     }
 
-    /// message_start。
-    pub fn start(&mut self, input_tokens_est: i64) -> String {
+    /// message_start。`cache_read` / `cache_creation` 来自合成缓存拆分（>0 才写入字段）。
+    pub fn start(&mut self, input_tokens_est: i64, cache_read: i64, cache_creation: i64) -> String {
         self.started = true;
+        let mut usage = json!({
+            "input_tokens": input_tokens_est.max(1),
+            "output_tokens": 0,
+        });
+        if cache_read > 0 {
+            usage["cache_read_input_tokens"] = json!(cache_read);
+        }
+        if cache_creation > 0 {
+            usage["cache_creation_input_tokens"] = json!(cache_creation);
+        }
         let data = json!({
             "type": "message_start",
             "message": {
@@ -346,7 +356,7 @@ impl ClaudeSseEncoder {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": { "input_tokens": input_tokens_est.max(1), "output_tokens": 0 }
+                "usage": usage
             }
         });
         Self::sse("message_start", &data)
@@ -639,7 +649,7 @@ mod tests {
     #[test]
     fn finish_honors_stop_override() {
         let mut enc = ClaudeSseEncoder::new("claude-sonnet-4.5".to_string(), Default::default());
-        let _ = enc.start(1);
+        let _ = enc.start(1, 0, 0);
         let out = enc.finish(&KiroUsage::default(), Some("max_tokens"));
         assert!(out.contains("\"stop_reason\":\"max_tokens\""), "got {out}");
     }
