@@ -239,6 +239,31 @@ export async function getRuntimeConfig(): Promise<Record<string, unknown>> {
   return data
 }
 
+// ===== Kiro 运行期配置（前端可改、即时生效、持久化到 DB）=====
+export interface KiroSettings {
+  compact: boolean
+  compact_threshold_tokens: number
+  tool_result_max_tokens: number
+  keep_recent_turns: number
+  synth_cache: boolean
+  filter_claude_code: boolean
+  strip_boundaries: boolean
+  env_noise: boolean
+}
+
+export async function getKiroSettings(): Promise<KiroSettings> {
+  const { data } = await http.get<KiroSettings>('/config/kiro')
+  return data
+}
+export async function updateKiroSettings(payload: KiroSettings): Promise<KiroSettings> {
+  const { data } = await http.put<KiroSettings>('/config/kiro', payload)
+  return data
+}
+export async function resetKiroSettings(): Promise<KiroSettings> {
+  const { data } = await http.delete<KiroSettings>('/config/kiro')
+  return data
+}
+
 export async function listLogs(
   params: { limit?: number; offset?: number } = {},
 ): Promise<LogsResp> {

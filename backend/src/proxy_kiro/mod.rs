@@ -152,14 +152,17 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
     }
     let client_wants_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // 运行期 kiro 配置快照（可被前端 /config/kiro 即时改写，故每请求取一次）。
+    let kcfg = app.kiro_cfg();
+
     // 透明上下文压缩：超过阈值时截断超大 tool_result + 丢最旧历史，压回 Kiro 上限内，避免
     // 「数据过长」被拒。在合成缓存计划之前做，使计费指纹与实际上送内容一致。
     // est_tokens 始终打 debug，便于跨请求标定 compact_threshold_tokens / Kiro 真实上限。
     let compact_cfg = compact::CompactConfig {
-        enabled: app.config.kiro.compact,
-        threshold_tokens: app.config.kiro.compact_threshold_tokens,
-        tool_result_max_tokens: app.config.kiro.tool_result_max_tokens,
-        keep_recent_turns: app.config.kiro.keep_recent_turns,
+        enabled: kcfg.compact,
+        threshold_tokens: kcfg.compact_threshold_tokens,
+        tool_result_max_tokens: kcfg.tool_result_max_tokens,
+        keep_recent_turns: kcfg.keep_recent_turns,
     };
     let est_tokens = compact::estimate_request_tokens(&raw);
     debug!(est_tokens, threshold = compact_cfg.threshold_tokens, "kiro 输入体量估算");
@@ -178,7 +181,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
 
     // 合成 prompt-cache 计费：按 CC 自带的 cache_control 断点算前缀命中（只算一次，避免
     // 重试时重复登记）。后面在拿到上游真实 input 总量后，据此把它拆成 read/creation/fresh。
-    let synth_cache: Option<(cache_synth::CachePlan, u32)> = if app.config.kiro.synth_cache {
+    let synth_cache: Option<(cache_synth::CachePlan, u32)> = if kcfg.synth_cache {
         let plan = cache_synth::build_plan(&raw);
         if plan.is_empty() {
             debug!("kiro synth-cache: 请求未带任何 cache_control → 不参与合成缓存（全 fresh）");
@@ -236,7 +239,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
         last_account = Some(selected.id.clone());
 
         // 翻译请求（每次重试都重建，conversationId/continuationId 会刷新，没问题）
-        let filter = prompt_filter::PromptFilterOptions::from_config(&app.config.kiro);
+        let filter = prompt_filter::PromptFilterOptions::from_config(&kcfg);
         let translated = match translator::translate(
             &raw,
             selected.profile_arn.as_deref().unwrap_or(""),

@@ -43,6 +43,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/stats", get(stats::overview))
         .route("/usage", get(usage::report))
         .route("/config", get(stats::current_config))
+        .route(
+            "/config/kiro",
+            get(stats::get_kiro_config)
+                .put(stats::put_kiro_config)
+                .delete(stats::delete_kiro_config),
+        )
         .route("/logs", get(logs::list).delete(logs::clear))
         // ===== Kiro 账号池 =====
         .route(

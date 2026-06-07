@@ -5,13 +5,16 @@ use crate::auth::claude_refresh::ClaudeRefresher;
 use crate::auth::kiro_refresh::KiroRefresher;
 use crate::auth::kiro_sso::KiroSsoLoginStore;
 use crate::auth::refresher::Refresher;
-use crate::config::Config;
+use crate::config::{Config, KiroConfig};
 use crate::pool::claude::ClaudePool;
 use crate::pool::kiro::KiroPool;
 use crate::pool::AccountPool;
 use crate::proxy::{ProxiedClients, RequestLog};
 use crate::proxy_pool::{legacy_pool_path, ProxyPool};
-use crate::store::{default_db_path, open as open_db, SqlitePool};
+use crate::store::{default_db_path, open as open_db, Kv, SqlitePool};
+
+/// 运行期可改的 kiro 配置在 kv 表里的持久化 key。
+pub const KIRO_CFG_KEY: &str = "kiro_config_overrides";
 
 /// 全局共享状态。
 pub struct AppState {
@@ -31,6 +34,9 @@ pub struct AppState {
     pub request_log: Arc<RequestLog>,
     /// kiro 反代合成 prompt-cache 计费的前缀指纹表（带 TTL）。
     pub kiro_prompt_cache: Arc<crate::proxy_kiro::cache_synth::PromptCacheStore>,
+    /// 运行期可改的 kiro 配置：启动时用 config.yaml 初始化、再被 DB 持久化值覆盖；
+    /// 前端 /config/kiro 改它即时生效（无需重启）。
+    pub kiro_runtime: Arc<std::sync::RwLock<KiroConfig>>,
 }
 
 impl AppState {
@@ -61,6 +67,9 @@ impl AppState {
         let kiro_prompt_cache =
             Arc::new(crate::proxy_kiro::cache_synth::PromptCacheStore::default());
 
+        // 运行期 kiro 配置：先取 config.yaml 值，再用 DB 里持久化的覆盖（解析失败仅 warn）。
+        let kiro_runtime = Arc::new(std::sync::RwLock::new(load_runtime_kiro(&db, &config.kiro)));
+
         Ok(Self {
             config,
             db,
@@ -77,6 +86,40 @@ impl AppState {
             claude_models_cache,
             request_log,
             kiro_prompt_cache,
+            kiro_runtime,
         })
+    }
+
+    /// 取当前运行期 kiro 配置的快照（克隆，避免把锁守卫带进请求处理）。KiroConfig 很小。
+    pub fn kiro_cfg(&self) -> KiroConfig {
+        self.kiro_runtime.read().unwrap().clone()
+    }
+}
+
+/// 启动时加载运行期 kiro 配置：DB 有持久化覆盖且能解析则用它，否则回退 config.yaml 值。
+fn load_runtime_kiro(db: &SqlitePool, file_default: &KiroConfig) -> KiroConfig {
+    let conn = match db.get() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("kiro 运行期配置：取 DB 连接失败，用 config.yaml 值: {e}");
+            return file_default.clone();
+        }
+    };
+    match Kv::get(&conn, KIRO_CFG_KEY) {
+        Ok(Some(json)) => match serde_json::from_str::<KiroConfig>(&json) {
+            Ok(cfg) => {
+                tracing::info!("kiro 运行期配置：已从 DB 加载持久化覆盖");
+                cfg
+            }
+            Err(e) => {
+                tracing::warn!("kiro 运行期配置：DB 值解析失败，用 config.yaml 值: {e}");
+                file_default.clone()
+            }
+        },
+        Ok(None) => file_default.clone(),
+        Err(e) => {
+            tracing::warn!("kiro 运行期配置：读 DB 失败，用 config.yaml 值: {e}");
+            file_default.clone()
+        }
     }
 }
