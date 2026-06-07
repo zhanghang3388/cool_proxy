@@ -40,6 +40,34 @@ pub struct KiroConfig {
     /// 只「拆分」真实总量、不放大，默认开。
     #[serde(default = "default_true")]
     pub synth_cache: bool,
+    /// 透明上下文压缩：Kiro 上游输入有服务端硬上限，超限会被拒（"Input is too long"）。
+    /// 开启后发送前估算输入 token，超过 `compact_threshold_tokens` 时自动：① 截断超大
+    /// tool_result 块；② 丢弃最旧历史轮次，压回限内再上送。有损（模型看不到被丢弃的旧
+    /// 上下文），但避免「数据过长」报错。默认开。
+    #[serde(default = "default_true")]
+    pub compact: bool,
+    /// 触发压缩的输入 token 阈值（估算，约 3 字节/token）。应设为略低于 Kiro 实测上限。
+    /// 默认 120000；可借日志里的 `est_tokens` 跨请求标定后调整。
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold_tokens: u32,
+    /// 单个 tool_result 块允许的最大 token，超出截断保留头部。默认 4000。
+    #[serde(default = "default_tool_result_max")]
+    pub tool_result_max_tokens: u32,
+    /// 压缩丢弃历史时至少保留最近多少轮对话（1 轮≈user+assistant 两条）。默认 8。
+    #[serde(default = "default_keep_recent_turns")]
+    pub keep_recent_turns: u32,
+}
+
+fn default_compact_threshold() -> u32 {
+    120_000
+}
+
+fn default_tool_result_max() -> u32 {
+    4_000
+}
+
+fn default_keep_recent_turns() -> u32 {
+    8
 }
 
 fn default_true() -> bool {
@@ -53,6 +81,10 @@ impl Default for KiroConfig {
             strip_boundaries: true,
             env_noise: true,
             synth_cache: true,
+            compact: true,
+            compact_threshold_tokens: default_compact_threshold(),
+            tool_result_max_tokens: default_tool_result_max(),
+            keep_recent_turns: default_keep_recent_turns(),
         }
     }
 }

@@ -3,6 +3,7 @@
 //! Anthropic SSE（流式）或单个 message JSON（非流式）。复用账号池 / 代理池 / 请求日志。
 
 pub mod cache_synth;
+pub mod compact;
 pub mod eventstream;
 pub mod payload;
 pub mod prompt_filter;
@@ -136,7 +137,7 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
             return anthropic_error(StatusCode::BAD_REQUEST, &format!("read request body: {e}"))
         }
     };
-    let raw: Value = match serde_json::from_slice(&body_bytes) {
+    let mut raw: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
     };
@@ -150,6 +151,30 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
         return anthropic_error(StatusCode::BAD_REQUEST, "missing required field: model");
     }
     let client_wants_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // 透明上下文压缩：超过阈值时截断超大 tool_result + 丢最旧历史，压回 Kiro 上限内，避免
+    // 「数据过长」被拒。在合成缓存计划之前做，使计费指纹与实际上送内容一致。
+    // est_tokens 始终打 debug，便于跨请求标定 compact_threshold_tokens / Kiro 真实上限。
+    let compact_cfg = compact::CompactConfig {
+        enabled: app.config.kiro.compact,
+        threshold_tokens: app.config.kiro.compact_threshold_tokens,
+        tool_result_max_tokens: app.config.kiro.tool_result_max_tokens,
+        keep_recent_turns: app.config.kiro.keep_recent_turns,
+    };
+    let est_tokens = compact::estimate_request_tokens(&raw);
+    debug!(est_tokens, threshold = compact_cfg.threshold_tokens, "kiro 输入体量估算");
+    if compact_cfg.enabled && est_tokens > compact_cfg.threshold_tokens {
+        let outcome = compact::compact_request(&mut raw, &compact_cfg);
+        if outcome.applied {
+            info!(
+                before = outcome.before_tokens,
+                after = outcome.after_tokens,
+                truncated_tool_results = outcome.truncated_tool_results,
+                dropped_messages = outcome.dropped_messages,
+                "kiro 上下文压缩已生效（有损：丢弃了部分旧上下文以适配上游上限）"
+            );
+        }
+    }
 
     // 合成 prompt-cache 计费：按 CC 自带的 cache_control 断点算前缀命中（只算一次，避免
     // 重试时重复登记）。后面在拿到上游真实 input 总量后，据此把它拆成 read/creation/fresh。
@@ -281,6 +306,32 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
                 } else {
                     let code = status.as_u16();
                     let snippet = read_snippet(resp).await;
+                    // 用户内容超长：CodeWhisperer 输入超过其上下文上限，是**内容问题**不是账号故障。
+                    // 不冷却账号、不跨账号重试（重试必然同样失败、只会白白冷却整池），直接回干净的 400。
+                    if is_input_too_long(&snippet) {
+                        warn!(
+                            account = %selected.id,
+                            "kiro 输入超长（上游上下文上限，非账号故障，不冷却/不重试）: {snippet}"
+                        );
+                        app.request_log.push(
+                            &parts.method,
+                            log_path,
+                            Some(selected.id.clone()),
+                            Some(model.clone()),
+                            StatusCode::BAD_REQUEST.as_u16(),
+                            started.elapsed().as_millis() as u64,
+                            attempt + 1,
+                            None,
+                            None,
+                            None,
+                            Some(snippet.clone()),
+                        );
+                        return anthropic_error(
+                            StatusCode::BAD_REQUEST,
+                            "上游 Kiro/CodeWhisperer 拒绝：输入超过其上下文上限（数据过长）。\
+                             请精简上下文后重试：清理历史对话 / 开启新会话，或减少一次性读取的大文件。",
+                        );
+                    }
                     if code == 401 || code == 403 {
                         handle_auth_error(&app, &selected.id, code, &snippet);
                         auth_failed = true;
@@ -406,6 +457,18 @@ async fn read_snippet(resp: reqwest::Response) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     collapsed.trim().chars().take(400).collect()
+}
+
+/// 上游错误是否为「输入超长」（CodeWhisperer 输入超过上下文上限）。
+/// 这是用户内容问题、不是账号故障：命中即应回干净的 400，不冷却账号、不跨账号重试。
+/// 短语集与流内异常帧 [`response::ResponseState::handle_error_frame`] 对齐。
+fn is_input_too_long(snippet: &str) -> bool {
+    let s = snippet.to_ascii_lowercase();
+    s.contains("contentlength")
+        || s.contains("content length")
+        || s.contains("input is too long")
+        || s.contains("too long")
+        || s.contains("input too long")
 }
 
 /// 诊断：统计请求里 system / tools / messages 各有多少块、其中多少块带 cache_control。
@@ -715,4 +778,28 @@ async fn aggregate_response(
 
     let obj = aggregate(&events, &usage, &model, &restore, stop_override);
     (StatusCode::OK, axum::Json(obj)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_input_too_long;
+
+    #[test]
+    fn detects_codewhisperer_too_long_variants() {
+        // 上游真实回报的几种形态（ValidationException / ContentLengthExceededException）。
+        assert!(is_input_too_long(
+            r#"ContentLengthExceededException: Input is too long"#
+        ));
+        assert!(is_input_too_long(
+            r#"{"__type":"ValidationException","message":"Input is too long for requested model."}"#
+        ));
+        assert!(is_input_too_long("the input is Too Long")); // 大小写无关
+    }
+
+    #[test]
+    fn does_not_flag_unrelated_errors() {
+        assert!(!is_input_too_long("ThrottlingException: rate exceeded"));
+        assert!(!is_input_too_long("AccessDeniedException: forbidden"));
+        assert!(!is_input_too_long("internal server error"));
+    }
 }
