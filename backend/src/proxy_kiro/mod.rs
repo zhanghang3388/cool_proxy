@@ -177,6 +177,9 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
                 msg_cc,
                 "kiro synth-cache (hit=0=未命中历史前缀; sys_ckpt 跨轮应一致)"
             );
+            // 临时诊断：打印第一个系统块开头 200 字符，定位「等长却每轮变」的易变前缀。
+            // 第一个系统块是 CC 开场白区，不含用户代码/对话内容。
+            debug!(sys0 = %first_system_snippet(&raw, 200), "kiro synth-cache sys0 (定位易变前缀)");
             Some((plan, hit))
         }
     } else {
@@ -435,6 +438,22 @@ fn cache_request_shape(raw: &Value) -> (usize, usize, usize, usize, usize, usize
         }
     }
     (sys_blocks, sys_cc, tools_n, tools_cc, msgs_n, msg_cc)
+}
+
+/// 临时诊断：取第一个系统块文本前 `n` 个字符（CC 开场白区，便于跨轮肉眼对比易变前缀）。
+fn first_system_snippet(raw: &Value, n: usize) -> String {
+    let text = match raw.get("system") {
+        Some(Value::String(s)) => s.as_str(),
+        Some(Value::Array(a)) => a
+            .first()
+            .and_then(|b| b.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        _ => "",
+    };
+    let snip: String = text.chars().take(n).collect();
+    // 把换行折叠成 ⏎ 方便单行查看
+    snip.replace('\n', "⏎")
 }
 
 /// 用合成缓存计划把 `total_input` 拆成 `(fresh_input, cache_read, cache_creation)`。
