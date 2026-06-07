@@ -88,6 +88,14 @@ impl CachePlan {
         self.checkpoints.len()
     }
 
+    /// 整个请求的累积可缓存 token 估算（最后一个块边界），= split 时的缩放分母。
+    pub fn total_estimated_tokens(&self) -> u32 {
+        self.checkpoints
+            .last()
+            .map(|c| c.cumulative_tokens)
+            .unwrap_or(0)
+    }
+
     /// 系统前缀（第一个块边界）的指纹前 12 位 + 累积 token（诊断用）。
     /// 跨轮对比这个值即可判断「被缓存前缀是否逐字节稳定」。
     pub fn first_checkpoint(&self) -> String {
@@ -224,15 +232,8 @@ impl PromptCacheStore {
 
 /// 把上游回报的真实总 input，依据 plan 命中情况拆成 read / creation / fresh。
 ///
-/// - `total_input`：上游 messageMetadataEvent 给的真实 input 总量（绝不超过它）；
-/// - `hit_tokens`：store 命中的前缀 token 数（来自 lookup_and_record）；
-/// - `plan`：本次请求的缓存计划，用其「最后一个断点的累积 token」作为「本应可缓存的前缀总量」。
-///
-/// 规则：
-///   cache_read     = min(hit_tokens, total_input)
-///   cacheable_total= min(最后断点累积 token, total_input)
-///   cache_creation = max(0, cacheable_total - cache_read)
-///   fresh_input    = total_input - cache_read - cache_creation
+/// 详见函数体注释：先在「估算口径」算出三段比例，再等比缩放到真实 `total_input`，
+/// 避免估算偏大把本轮 creation 额度吃掉（多轮 creation 恒 0 的根因）。
 pub fn split_usage(total_input: i64, hit_tokens: u32, plan: &CachePlan) -> CacheSplit {
     if total_input <= 0 || plan.breakpoints.is_empty() {
         return CacheSplit {
@@ -241,14 +242,38 @@ pub fn split_usage(total_input: i64, hit_tokens: u32, plan: &CachePlan) -> Cache
             fresh_input: total_input.max(0),
         };
     }
-    let cacheable_total = plan
-        .breakpoints
-        .last()
-        .map(|b| b.cumulative_tokens as i64)
-        .unwrap_or(0)
-        .min(total_input);
-    let cache_read = (hit_tokens as i64).min(cacheable_total).min(total_input);
-    let cache_creation = (cacheable_total - cache_read).max(0);
+    // read/creation/fresh 的比例先在「估算口径」里算出来（三段同一套 3 字节/token 估算，
+    // 内部自洽），再整体等比缩放到真实 total_input。
+    //
+    // 为什么不能直接跨口径 min/相减：估算（在未过滤的原始请求上、按 3 字节/token）系统性比
+    // 上游真实分词偏大。旧实现拿「估算口径的 hit」去 min/减「真实口径的 total」，虚高的 hit 把
+    // 本属于「本轮新增」的 creation 额度整个吃掉 —— 多轮里 creation 恒为 0、read 恒等于全部，
+    // 命中率诡异地接近满。等比缩放保留了「本轮 delta」这一段，creation 如实反映每轮新增。
+    //
+    // 记 e_total=全请求累积估算，e_cacheable=最后断点累积估算，e_hit=命中估算
+    // （lookup 保证 e_hit ≤ e_cacheable ≤ e_total）：
+    //   cache_read     = total_input * e_hit       / e_total
+    //   cacheable      = total_input * e_cacheable / e_total
+    //   cache_creation = cacheable - cache_read
+    //   fresh_input    = total_input - cacheable
+    // 三者之和恒等于 total_input（末项吸收整除余数），且都 ≥ 0。
+    let e_total = plan.total_estimated_tokens() as i128;
+    if e_total <= 0 {
+        return CacheSplit {
+            cache_read: 0,
+            cache_creation: 0,
+            fresh_input: total_input,
+        };
+    }
+    let e_cacheable = (plan.cacheable_tokens() as i128).min(e_total);
+    // hit 钳到 cacheable 上界，防御估算漂移（正常 lookup 已保证 ≤）。
+    let e_hit = (hit_tokens as i128).min(e_cacheable);
+    let total = total_input as i128;
+
+    // 同一缩放因子 total/e_total 作用于 hit 与 cacheable，保证比例不被破坏。
+    let cache_read = (total * e_hit / e_total) as i64;
+    let cacheable = (total * e_cacheable / e_total) as i64;
+    let cache_creation = (cacheable - cache_read).max(0);
     let fresh_input = (total_input - cache_read - cache_creation).max(0);
     CacheSplit {
         cache_read,
@@ -781,6 +806,52 @@ mod tests {
             "规范化后第 2 轮应命中上一轮缓存前缀, got read={}",
             sp2.cache_read
         );
+        assert_eq!(sp2.cache_read + sp2.cache_creation + sp2.fresh_input, total);
+    }
+
+    /// 根因回归：缓存前缀的**估算**远大于上游**真实** total_input 时（CC 大 system + 3 字节/token
+    /// 高估 + 上游过滤），旧实现会把第 2 轮的 cache_creation 挤成 0、read 顶满。等比缩放后，
+    /// 第 2 轮应如实把「本轮新增 delta」记成 creation（>0），而非全部当 read。
+    #[test]
+    fn delta_is_billed_as_creation_not_swallowed() {
+        let store = PromptCacheStore::new(256);
+        // 大而稳定的 system（不带 cc），断点滑动在最后一条 user 上。
+        let sys = "S".repeat(9000); // ~3000 估算 token
+        // 上游真实总量远小于估算（模拟过滤 + 高估）。
+        let total = 2_000i64;
+
+        let turn = |msgs: Vec<Value>| {
+            json!({
+                "model":"claude-opus-4-8",
+                "system":[ json!({"type":"text","text": sys}) ],
+                "messages": msgs,
+            })
+        };
+
+        // 第 1 轮：仅 user1 带 cc。
+        let p1 = build_plan(&turn(vec![user_msg(&"U".repeat(3000), true)]));
+        let h1 = store.lookup_and_record(&p1);
+        let sp1 = split_usage(total, h1, &p1);
+        assert_eq!(sp1.cache_read, 0, "首轮无历史应全 creation");
+        assert!(sp1.cache_creation > 0);
+        assert_eq!(sp1.cache_read + sp1.cache_creation + sp1.fresh_input, total);
+
+        // 第 2 轮：user1 转为历史（无 cc），新增 assistant + user2（cc 滑到 user2）。
+        let p2 = build_plan(&turn(vec![
+            user_msg(&"U".repeat(3000), false),
+            asst_msg(&"A".repeat(3000)),
+            user_msg(&"U2".repeat(1500), true),
+        ]));
+        let h2 = store.lookup_and_record(&p2);
+        let sp2 = split_usage(total, h2, &p2);
+        // 关键断言：旧实现这里 creation==0；新实现应 >0（本轮新增的 assistant+user2 计入 creation）。
+        assert!(
+            sp2.cache_creation > 0,
+            "本轮 delta 应记成 creation，不应被高估的 read 吃掉，got creation={}",
+            sp2.cache_creation
+        );
+        // 既要读到上一轮缓存的前缀，也要保持总量守恒。
+        assert!(sp2.cache_read > 0, "应读到上一轮缓存前缀");
         assert_eq!(sp2.cache_read + sp2.cache_creation + sp2.fresh_input, total);
     }
 
