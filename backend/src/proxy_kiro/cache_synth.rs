@@ -82,6 +82,33 @@ impl CachePlan {
             .map(|b| b.cumulative_tokens)
             .unwrap_or(0)
     }
+
+    /// 块边界（checkpoint）数（诊断用；旧版无此字段，可借此确认新代码已部署）。
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    /// 系统前缀（第一个块边界）的指纹前 12 位 + 累积 token（诊断用）。
+    /// 跨轮对比这个值即可判断「被缓存前缀是否逐字节稳定」。
+    pub fn first_checkpoint(&self) -> String {
+        match self.checkpoints.first() {
+            Some(c) => format!("{}:{}", short(&c.prefix_digest), c.cumulative_tokens),
+            None => "none".to_string(),
+        }
+    }
+
+    /// 本次声明的各 cache_control 断点指纹前 12 位 + 累积 token（诊断用）。
+    pub fn breakpoint_digests(&self) -> Vec<String> {
+        self.breakpoints
+            .iter()
+            .map(|b| format!("{}:{}", short(&b.prefix_digest), b.cumulative_tokens))
+            .collect()
+    }
+}
+
+/// 取指纹前 12 位，便于日志里跨轮肉眼对比。
+fn short(digest: &str) -> &str {
+    &digest[..digest.len().min(12)]
 }
 
 /// 缓存计费拆分结果：三者之和应等于上游真实总 input。

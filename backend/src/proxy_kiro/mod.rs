@@ -156,14 +156,26 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
     let synth_cache: Option<(cache_synth::CachePlan, u32)> = if app.config.kiro.synth_cache {
         let plan = cache_synth::build_plan(&raw);
         if plan.is_empty() {
+            debug!("kiro synth-cache: 请求未带任何 cache_control → 不参与合成缓存（全 fresh）");
             None
         } else {
             let hit = app.kiro_prompt_cache.lookup_and_record(&plan);
+            // 诊断：sys_ckpt 跨轮应稳定；hit>0 表示命中历史前缀。checkpoints 字段仅新代码有。
+            let (sys_blocks, sys_cc, tools_n, tools_cc, msgs_n, msg_cc) = cache_request_shape(&raw);
             debug!(
                 hit,
                 breakpoints = plan.breakpoint_count(),
+                checkpoints = plan.checkpoint_count(),
                 cacheable = plan.cacheable_tokens(),
-                "kiro synth-cache: prefix hit (hit=0 表示本轮未命中历史缓存前缀)"
+                sys_ckpt = %plan.first_checkpoint(),
+                bp_digests = ?plan.breakpoint_digests(),
+                sys_blocks,
+                sys_cc,
+                tools_n,
+                tools_cc,
+                msgs_n,
+                msg_cc,
+                "kiro synth-cache (hit=0=未命中历史前缀; sys_ckpt 跨轮应一致)"
             );
             Some((plan, hit))
         }
@@ -391,6 +403,38 @@ async fn read_snippet(resp: reqwest::Response) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     collapsed.trim().chars().take(400).collect()
+}
+
+/// 诊断：统计请求里 system / tools / messages 各有多少块、其中多少块带 cache_control。
+/// 帮助判断「上游（CC/cool_api）到底有没有把 cache_control 打在稳定前缀（system/tools）上」。
+fn cache_request_shape(raw: &Value) -> (usize, usize, usize, usize, usize, usize) {
+    let (mut sys_blocks, mut sys_cc) = (0usize, 0usize);
+    match raw.get("system") {
+        Some(Value::String(_)) => sys_blocks = 1,
+        Some(Value::Array(a)) => {
+            sys_blocks = a.len();
+            sys_cc = a.iter().filter(|b| b.get("cache_control").is_some()).count();
+        }
+        _ => {}
+    }
+    let (mut tools_n, mut tools_cc) = (0usize, 0usize);
+    if let Some(t) = raw.get("tools").and_then(|v| v.as_array()) {
+        tools_n = t.len();
+        tools_cc = t.iter().filter(|x| x.get("cache_control").is_some()).count();
+    }
+    let (mut msgs_n, mut msg_cc) = (0usize, 0usize);
+    if let Some(m) = raw.get("messages").and_then(|v| v.as_array()) {
+        msgs_n = m.len();
+        for msg in m {
+            if let Some(blocks) = msg.get("content").and_then(|v| v.as_array()) {
+                msg_cc += blocks
+                    .iter()
+                    .filter(|b| b.get("cache_control").is_some())
+                    .count();
+            }
+        }
+    }
+    (sys_blocks, sys_cc, tools_n, tools_cc, msgs_n, msg_cc)
 }
 
 /// 用合成缓存计划把 `total_input` 拆成 `(fresh_input, cache_read, cache_creation)`。
