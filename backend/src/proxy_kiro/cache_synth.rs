@@ -277,9 +277,12 @@ pub fn build_plan(raw: &Value) -> CachePlan {
                     breakpoints: &mut Vec<Breakpoint>,
                     text: &str,
                     cache_control: Option<&Value>| {
-        hasher.update(text.as_bytes());
+        // 规范化后再喂指纹：剥掉头部逐轮变化的 git/日期/环境噪音，让稳定前缀逐字节一致。
+        // token 也按规范化后文本估算，保证「同一前缀两轮估算相等」（防御性 min 不会无故缩水）。
+        let canon = canonicalize_for_fingerprint(text);
+        hasher.update(canon.as_bytes());
         hasher.update(b"\x1f"); // 块分隔符，避免相邻块拼接歧义
-        *cumulative_tokens += estimate_tokens(text);
+        *cumulative_tokens += estimate_tokens(&canon);
         let digest = format!("{:x}", hasher.clone().finalize());
         checkpoints.push(Checkpoint {
             prefix_digest: digest.clone(),
@@ -418,6 +421,121 @@ fn estimate_tokens(text: &str) -> u32 {
     } else {
         ((text.len() / BYTES_PER_TOKEN) as u32).max(1)
     }
+}
+
+/// 仅用于「计费指纹」的规范化：剥掉 Claude Code / cool_api 在请求头部夹带的、
+/// 同一会话相邻两轮之间会变化的噪音（git 状态、最近提交、当前日期、环境段等），
+/// 让「稳定前缀」逐字节一致，从而跨轮命中合成缓存。
+///
+/// 重要：本函数**只影响指纹与 token 估算**，绝不改动发往上游的 payload
+/// （上游 system 过滤在 translator / prompt_filter，是另一条独立路径）。
+/// 它比 prompt_filter 的上游去噪更激进：上游漏删只是多几行噪音（无害），
+/// 指纹漏删却会直接打穿缓存命中，故这里宁可多删——确定性删除不影响同一会话的稳定性，
+/// 只在「两个不同对话恰好仅在被删行上不同」这种极罕见情形下可能误并（代价仅是多报一点 read）。
+pub(crate) fn canonicalize_for_fingerprint(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut skip_section = false; // `# Environment` / `# auto memory` 整段
+    let mut in_commits = false; // `Recent commits:` 之后的逐条提交行
+    let mut in_status = false; // git `Status:` 之后的文件清单
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+
+        // 任何新标题/新标记都终结正在跳过的 commits / status 自由文本块（防止它们吞掉后续正文）。
+        if trimmed.starts_with("# ")
+            || trimmed.starts_with("Recent commits:")
+            || trimmed == "Status:"
+            || is_volatile_line(trimmed, &lower)
+        {
+            in_commits = false;
+            in_status = false;
+        }
+
+        // `# Environment` / `# auto memory` 整段跳过（到下一个 "# " 标题为止）。
+        if trimmed == "# Environment" || trimmed == "# auto memory" {
+            skip_section = true;
+            continue;
+        }
+        if skip_section {
+            if trimmed.starts_with("# ") {
+                skip_section = false; // 保留这个新标题
+            } else {
+                continue;
+            }
+        }
+
+        // git `Status:` 标题及其后的文件清单（到空行为止）整体跳过——文件状态随编辑而变。
+        if trimmed == "Status:" {
+            in_status = true;
+            continue;
+        }
+        if in_status {
+            if trimmed.is_empty() {
+                in_status = false;
+            }
+            continue;
+        }
+
+        // `Recent commits:` 标题及其后逐条提交行（`<7-40 hex> <msg>`）整体跳过。
+        if trimmed.starts_with("Recent commits:") {
+            in_commits = true;
+            continue;
+        }
+        if in_commits {
+            if trimmed.is_empty() || looks_like_commit_line(trimmed) {
+                continue;
+            }
+            in_commits = false; // 提交块结束，落下去正常处理本行
+        }
+
+        if is_volatile_line(trimmed, &lower) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// 判断一行是否为「同一会话相邻两轮间会变」的噪音行（与 prompt_filter 对齐并扩展）。
+fn is_volatile_line(trimmed: &str, lower: &str) -> bool {
+    const VOLATILE_PREFIXES: &[&str] = &[
+        "gitStatus:",
+        "Current branch:",
+        "Main branch",
+        "Git user:",
+        "Today's date is",
+        "# currentDate",
+        "Assistant knowledge cutoff",
+        "x-anthropic-billing-header:",
+        "<fast_mode_info>",
+        "</fast_mode_info>",
+    ];
+    const VOLATILE_CONTAINS: &[&str] = &[
+        ".claude/projects/",
+        "git status at the start of the conversation",
+        "has been invoked in the following environment",
+        "powered by the model named",
+    ];
+    if VOLATILE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        return true;
+    }
+    if VOLATILE_CONTAINS.iter().any(|p| trimmed.contains(p)) {
+        return true;
+    }
+    lower.contains("you are claude code")
+}
+
+/// 形如 `<7-40 位十六进制> <消息>` 的 git 提交行（`Recent commits:` 之后逐条提交）。
+fn looks_like_commit_line(trimmed: &str) -> bool {
+    let mut it = trimmed.splitn(2, char::is_whitespace);
+    let first = it.next().unwrap_or("");
+    let rest = it.next().unwrap_or("");
+    !rest.is_empty()
+        && (7..=40).contains(&first.len())
+        && first.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -607,9 +725,91 @@ mod tests {
             sp3.cache_read
         );
         // 三者之和恒等于上游真实总量。
-        assert_eq!(
-            sp3.cache_read + sp3.cache_creation + sp3.fresh_input,
-            total
+        assert_eq!(sp3.cache_read + sp3.cache_creation + sp3.fresh_input, total);
+    }
+
+    /// 根因回归：system 第一块头部每轮变化（git 状态 / commit 列表 / 当前日期），
+    /// 但稳定正文与历史问答不变。规范化后，第 2 轮起应命中上一轮缓存的前缀。
+    /// 改造前（指纹喂原始 raw）此用例必然 read=0；改造后应 read>0。
+    #[test]
+    fn volatile_header_still_hits() {
+        let store = PromptCacheStore::new(256);
+        let stable = "S".repeat(900); // 稳定 system 正文
+        let total = 100_000i64;
+
+        // 头部噪音逐轮变：commit 短哈希、文件状态、当前日期都不同。
+        let sys = |commit: &str, date: &str, status: &str| {
+            format!(
+                "You are Claude Code, Anthropic's official CLI for Claude.\n\
+                 Current branch: main\n\
+                 Status:\n{status}\n\
+                 Recent commits:\n{commit} kiro: tweak\n\
+                 # currentDate\nToday's date is {date}\n\n{stable}"
+            )
+        };
+        let turn = |sys_text: String, msgs: Vec<Value>| {
+            json!({
+                "model":"claude-opus-4-8",
+                "system":[ json!({"type":"text","text": sys_text}) ],
+                "tools":[ tool() ],
+                "messages": msgs,
+            })
+        };
+
+        let p1 = build_plan(&turn(
+            sys("aaaaaaa", "2026/06/06", " M src/a.rs"),
+            vec![user_msg("hello-1", true)],
+        ));
+        let h1 = store.lookup_and_record(&p1);
+        let sp1 = split_usage(total, h1, &p1);
+        assert_eq!(sp1.cache_read, 0, "首轮无历史应全 creation");
+        assert!(sp1.cache_creation > 0);
+
+        // 第 2 轮：头部三处全变，但稳定正文 + hello-1 不变。
+        let p2 = build_plan(&turn(
+            sys("bbbbbbb", "2026/06/07", " M src/b.rs\n M src/c.rs"),
+            vec![
+                user_msg("hello-1", false),
+                asst_msg("hi-1"),
+                user_msg("hello-2", true),
+            ],
+        ));
+        let h2 = store.lookup_and_record(&p2);
+        let sp2 = split_usage(total, h2, &p2);
+        assert!(
+            sp2.cache_read > 0,
+            "规范化后第 2 轮应命中上一轮缓存前缀, got read={}",
+            sp2.cache_read
         );
+        assert_eq!(sp2.cache_read + sp2.cache_creation + sp2.fresh_input, total);
+    }
+
+    /// 规范化对「仅头部噪音不同」的两段文本应产出**逐字节相同**的结果，且保留正文。
+    #[test]
+    fn canonicalize_strips_volatile_and_is_deterministic() {
+        let a = canonicalize_for_fingerprint(
+            "keep this\n\
+             gitStatus: dirty\n\
+             Current branch: main\n\
+             Status:\n M foo.rs\n M bar.rs\n\
+             Recent commits:\n225926a kiro: x\n09e1358 kiro: y\n\
+             # currentDate\nToday's date is 2026/06/07\n\
+             also keep",
+        );
+        let b = canonicalize_for_fingerprint(
+            "keep this\n\
+             gitStatus: clean\n\
+             Current branch: feature/z\n\
+             Status:\n(clean)\n\
+             Recent commits:\ndeadbee kiro: p\n\
+             # currentDate\nToday's date is 2026/06/08\n\
+             also keep",
+        );
+        assert_eq!(a, b, "仅头部噪音不同 → 规范化后应一致");
+        assert!(a.contains("keep this") && a.contains("also keep"));
+        assert!(!a.contains("gitStatus"));
+        assert!(!a.contains("Current branch"));
+        assert!(!a.contains("Today's date"));
+        assert!(!a.contains("foo.rs") && !a.contains("225926a"));
     }
 }
