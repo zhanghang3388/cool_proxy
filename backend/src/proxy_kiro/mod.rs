@@ -159,6 +159,12 @@ pub async fn messages_handler(State(app): State<Arc<AppState>>, req: Request) ->
             None
         } else {
             let hit = app.kiro_prompt_cache.lookup_and_record(&plan);
+            debug!(
+                hit,
+                breakpoints = plan.breakpoint_count(),
+                cacheable = plan.cacheable_tokens(),
+                "kiro synth-cache: prefix hit (hit=0 表示本轮未命中历史缓存前缀)"
+            );
             Some((plan, hit))
         }
     } else {

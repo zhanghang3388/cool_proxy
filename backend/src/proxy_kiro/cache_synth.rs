@@ -43,15 +43,44 @@ struct Breakpoint {
     ttl: Duration,
 }
 
-/// 解析请求得到的缓存计划：一串断点（按出现顺序）。空表示请求没打任何 cache_control。
+/// 请求里**每个块边界**的累积前缀：用于 lookup 时按「最长前缀」命中历史缓存，
+/// 与本次是否在该位置打了 cache_control 无关（对齐 Anthropic「命中最长缓存前缀」语义）。
+#[derive(Debug, Clone)]
+struct Checkpoint {
+    /// 到此块（含）为止的累积 SHA256 十六进制指纹。
+    prefix_digest: String,
+    /// 到此块（含）为止的累积可缓存 token 估算数。
+    cumulative_tokens: u32,
+}
+
+/// 解析请求得到的缓存计划。
+///
+/// - `checkpoints`：**每个块边界**的累积前缀（按出现顺序，token 递增），lookup 用；
+/// - `breakpoints`：带 `cache_control` 的断点（checkpoints 的子集），record（写入/续期）用。
+///
+/// `is_empty()` 以 breakpoints 为准：没打任何 cache_control 即视为「不参与合成缓存」。
 #[derive(Debug, Clone, Default)]
 pub struct CachePlan {
+    checkpoints: Vec<Checkpoint>,
     breakpoints: Vec<Breakpoint>,
 }
 
 impl CachePlan {
     pub fn is_empty(&self) -> bool {
         self.breakpoints.is_empty()
+    }
+
+    /// 本次请求声明的 cache_control 断点数（诊断用）。
+    pub fn breakpoint_count(&self) -> usize {
+        self.breakpoints.len()
+    }
+
+    /// 可缓存前缀总量 = 到最后一个 cache_control 断点为止的累积 token（诊断用）。
+    pub fn cacheable_tokens(&self) -> u32 {
+        self.breakpoints
+            .last()
+            .map(|b| b.cumulative_tokens)
+            .unwrap_or(0)
     }
 }
 
@@ -95,10 +124,14 @@ impl PromptCacheStore {
         }
     }
 
-    /// 核心：对一个 CachePlan 计算「命中多少前缀」，并把当前所有断点写入/续期。
+    /// 核心：对一个 CachePlan 计算「命中多少前缀」，并把当前所有 cache_control 断点写入/续期。
     ///
-    /// 返回命中的 token 数（即可计入 cache_read 的部分）。命中规则：在 plan 的断点里，
-    /// 从**最长**前缀往短找，第一个仍存活于表中的断点即命中，其 cumulative_tokens 即命中量。
+    /// 命中规则（对齐 Anthropic「命中最长缓存前缀」）：在本次请求的**每个块边界**
+    /// （checkpoints）里，找一个仍存活于 store、且不超过本次可缓存区域（最后一个 cache_control
+    /// 断点）的、token 最大者。**与本次是否在该位置重新打 cache_control 无关**——这才能让
+    /// 「断点随对话前移」的多轮场景在第 2 轮起读到上一轮缓存的前缀。
+    ///
+    /// 写入：只在带 cache_control 的断点处登记/续期（写语义不变）。
     pub fn lookup_and_record(&self, plan: &CachePlan) -> u32 {
         if plan.breakpoints.is_empty() {
             return 0;
@@ -109,12 +142,20 @@ impl PromptCacheStore {
         // 先清过期项（顺手控制规模）。
         map.retain(|_, e| e.expires_at > now);
 
-        // 命中判定：最长前缀优先。
+        // 可缓存区域上界 = 最后一个 cache_control 断点的累积 token。
+        let cacheable_tokens = plan.cacheable_tokens();
+
+        // 命中判定：在「本次请求的所有块边界」里，从最长前缀往短找，第一个仍存活于表中
+        // 且 ≤ cacheable 的边界即命中（checkpoints 按 token 递增，rev 即从长到短）。
         let mut hit_tokens = 0u32;
-        for bp in plan.breakpoints.iter().rev() {
-            if let Some(entry) = map.get(&bp.prefix_digest) {
+        for cp in plan.checkpoints.iter().rev() {
+            if cp.cumulative_tokens > cacheable_tokens {
+                continue; // 超出本次可缓存区域，不计入 read
+            }
+            if let Some(entry) = map.get(&cp.prefix_digest) {
                 if entry.expires_at > now {
-                    hit_tokens = entry.tokens;
+                    // 取较小者防御估算漂移；同一前缀两次估算本应相等。
+                    hit_tokens = entry.tokens.min(cp.cumulative_tokens);
                     break;
                 }
             }
@@ -191,26 +232,34 @@ pub fn split_usage(total_input: i64, hit_tokens: u32, plan: &CachePlan) -> Cache
 
 /// 从 Anthropic Messages 请求 JSON 解析缓存计划。
 ///
-/// 扫描带 `cache_control` 的块，按出现顺序（system → tools → messages）累积前缀指纹与
-/// token 估算，每遇到一个 cache_control 断点就记一条 Breakpoint，最多 MAX_BREAKPOINTS 个。
-/// 块的 ttl 取自 `cache_control.ttl`（"1h" → 1 小时，其余 → 5 分钟）。
+/// 按出现顺序（system → tools → messages）逐块累积前缀指纹与 token 估算：
+///  - **每个块**都落一个 checkpoint（用于 lookup 时按最长前缀命中历史缓存）；
+///  - 带 `cache_control` 的块**额外**落一个 Breakpoint（用于 record），最多 MAX_BREAKPOINTS 个，
+///    其 ttl 取自 `cache_control.ttl`（"1h" → 1 小时，其余 → 5 分钟）。
 pub fn build_plan(raw: &Value) -> CachePlan {
     let mut hasher = Sha256::new();
     let mut cumulative_tokens: u32 = 0;
+    let mut checkpoints: Vec<Checkpoint> = Vec::new();
     let mut breakpoints: Vec<Breakpoint> = Vec::new();
 
-    // 累加一个「块」：把其文本喂进指纹、累加 token；若带 cache_control 则落一个断点。
-    let mut feed = |hasher: &mut Sha256,
+    // 累加一个「块」：喂指纹、累加 token，每块都落一个 checkpoint（lookup 用）；
+    // 若该块带 cache_control 则**额外**落一个 Breakpoint（record 用）。
+    let feed = |hasher: &mut Sha256,
                     cumulative_tokens: &mut u32,
+                    checkpoints: &mut Vec<Checkpoint>,
                     breakpoints: &mut Vec<Breakpoint>,
                     text: &str,
                     cache_control: Option<&Value>| {
         hasher.update(text.as_bytes());
         hasher.update(b"\x1f"); // 块分隔符，避免相邻块拼接歧义
         *cumulative_tokens += estimate_tokens(text);
+        let digest = format!("{:x}", hasher.clone().finalize());
+        checkpoints.push(Checkpoint {
+            prefix_digest: digest.clone(),
+            cumulative_tokens: *cumulative_tokens,
+        });
         if let Some(cc) = cache_control {
             if breakpoints.len() < MAX_BREAKPOINTS {
-                let digest = format!("{:x}", hasher.clone().finalize());
                 breakpoints.push(Breakpoint {
                     prefix_digest: digest,
                     cumulative_tokens: *cumulative_tokens,
@@ -222,15 +271,21 @@ pub fn build_plan(raw: &Value) -> CachePlan {
 
     // 1) system：字符串或块数组
     match raw.get("system") {
-        Some(Value::String(s)) => {
-            feed(&mut hasher, &mut cumulative_tokens, &mut breakpoints, s, None)
-        }
+        Some(Value::String(s)) => feed(
+            &mut hasher,
+            &mut cumulative_tokens,
+            &mut checkpoints,
+            &mut breakpoints,
+            s,
+            None,
+        ),
         Some(Value::Array(blocks)) => {
             for b in blocks {
                 let text = b.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 feed(
                     &mut hasher,
                     &mut cumulative_tokens,
+                    &mut checkpoints,
                     &mut breakpoints,
                     text,
                     b.get("cache_control"),
@@ -253,6 +308,7 @@ pub fn build_plan(raw: &Value) -> CachePlan {
             feed(
                 &mut hasher,
                 &mut cumulative_tokens,
+                &mut checkpoints,
                 &mut breakpoints,
                 &text,
                 t.get("cache_control"),
@@ -264,15 +320,21 @@ pub fn build_plan(raw: &Value) -> CachePlan {
     if let Some(messages) = raw.get("messages").and_then(|v| v.as_array()) {
         for m in messages {
             match m.get("content") {
-                Some(Value::String(s)) => {
-                    feed(&mut hasher, &mut cumulative_tokens, &mut breakpoints, s, None)
-                }
+                Some(Value::String(s)) => feed(
+                    &mut hasher,
+                    &mut cumulative_tokens,
+                    &mut checkpoints,
+                    &mut breakpoints,
+                    s,
+                    None,
+                ),
                 Some(Value::Array(blocks)) => {
                     for b in blocks {
                         let text = block_text(b);
                         feed(
                             &mut hasher,
                             &mut cumulative_tokens,
+                            &mut checkpoints,
                             &mut breakpoints,
                             &text,
                             b.get("cache_control"),
@@ -284,7 +346,10 @@ pub fn build_plan(raw: &Value) -> CachePlan {
         }
     }
 
-    CachePlan { breakpoints }
+    CachePlan {
+        checkpoints,
+        breakpoints,
+    }
 }
 
 /// 取一个 content 块的代表文本（用于指纹 + token 估算）。
@@ -441,5 +506,83 @@ mod tests {
         });
         let plan = build_plan(&raw);
         assert_eq!(plan.breakpoints.len(), MAX_BREAKPOINTS);
+    }
+
+    // ===== 多轮缓存命中场景的辅助构造 =====
+    fn user_msg(text: &str, cc: bool) -> Value {
+        let mut block = json!({"type":"text","text":text});
+        if cc {
+            block["cache_control"] = json!({"type":"ephemeral","ttl":"5m"});
+        }
+        json!({"role":"user","content":[block]})
+    }
+    fn asst_msg(text: &str) -> Value {
+        json!({"role":"assistant","content":[{"type":"text","text":text}]})
+    }
+    fn tool() -> Value {
+        json!({"name":"Read","description":"reads a file","input_schema":{"type":"object"}})
+    }
+
+    /// 忠实复现真实多轮 Claude Code：system / tools **不带** cache_control，
+    /// 只有「最后一条 user」带 cache_control，断点随对话往前滑动。
+    /// 这正是 cool_api 把断点收敛成单个滑动断点后的样子。
+    #[test]
+    fn repro_single_moving_breakpoint() {
+        let store = PromptCacheStore::new(256);
+        let s = "S".repeat(900); // 稳定 system，但**不带** cache_control
+        let total = 100_000i64;
+
+        // 构造第 n 轮：messages 累积，仅最后一条 user 带 cc；system/tools 不带 cc。
+        let turn = |msgs: Vec<Value>| {
+            json!({
+                "model":"claude-opus-4-8",
+                "system":[ json!({"type":"text","text": s}) ],
+                "tools":[ tool() ],
+                "messages": msgs,
+            })
+        };
+
+        let p1 = build_plan(&turn(vec![user_msg("hello-1", true)]));
+        let h1 = store.lookup_and_record(&p1);
+        let sp1 = split_usage(total, h1, &p1);
+        // 首轮无历史 → 全 creation、无 read。
+        assert_eq!(sp1.cache_read, 0, "turn1 should have no read");
+        assert!(sp1.cache_creation > 0, "turn1 should write cache");
+
+        let p2 = build_plan(&turn(vec![
+            user_msg("hello-1", false),
+            asst_msg("hi-1"),
+            user_msg("hello-2", true),
+        ]));
+        let h2 = store.lookup_and_record(&p2);
+        let sp2 = split_usage(total, h2, &p2);
+        // 修复关键：第 2 轮即便只有滑动断点，也应读到上一轮缓存过的前缀（到 hello-1 为止）。
+        assert!(
+            sp2.cache_read > 0,
+            "turn2 must read the prefix cached on turn1, got read={}",
+            sp2.cache_read
+        );
+
+        let p3 = build_plan(&turn(vec![
+            user_msg("hello-1", false),
+            asst_msg("hi-1"),
+            user_msg("hello-2", false),
+            asst_msg("hi-2"),
+            user_msg("hello-3", true),
+        ]));
+        let h3 = store.lookup_and_record(&p3);
+        let sp3 = split_usage(total, h3, &p3);
+        // 读量随对话增长（命中到上一轮 hello-2 为止的更长前缀）。
+        assert!(
+            sp3.cache_read >= sp2.cache_read,
+            "turn3 read should not shrink: turn2={} turn3={}",
+            sp2.cache_read,
+            sp3.cache_read
+        );
+        // 三者之和恒等于上游真实总量。
+        assert_eq!(
+            sp3.cache_read + sp3.cache_creation + sp3.fresh_input,
+            total
+        );
     }
 }
